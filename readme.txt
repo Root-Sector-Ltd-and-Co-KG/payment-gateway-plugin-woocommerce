@@ -18,6 +18,13 @@ Your first and last Payment Gateway to accept payments through multiple payment 
 
 This plugin requires a multi-payment-gateway installation.
 
+== Installation ==
+
+1. Navigate to the `Add New` plugins screen in your WordPress Dashboard.
+2. Click the `Upload` tab.
+3. Browse for the plugin file (woocommerce-multi-payment-gateway.zip) on your computer.
+4. Click `Install Now` and then activate the plugin.
+
 == Changelog ==
 
 = 1.0.0 =
