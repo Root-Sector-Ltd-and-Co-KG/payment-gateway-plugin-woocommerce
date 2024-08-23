@@ -1,26 +1,21 @@
 <?php
 /**
- * Plugin Name: WooCommerce multi-payment-gateway
- * Plugin URI: https://wordpress.org/plugins/woocommerce-multi-payment-gateway/
- * Description: Streamline your online payment process with our all-in-one multi payment gateway, enabling you to accept multiple payment methods effortlessly and delighting your customers with a hassle-free checkout experience.
+ * Plugin Name: WooCommerce Multi Payment Gateway
+ * Plugin URI: https://root-sector.com
+ * Description: WooCommerce Multi Payment Gateway Extension.
  * Version: 1.0.0
  * Requires at least: 6.4
  * Requires PHP: 8.1
  * Author: Root Sector Ltd. & Co. KG
  * Author URI: https://root-sector.com
+ * WC requires at least: 9.2
+ * WC tested up to: 9.2
  * License: GPLv3
  * License URI: https://www.gnu.org/licenses/gpl-3.0.html
  */
-add_action('plugins_loaded', 'init_woocommerce_multi_payment_gateway', 0);
+defined('ABSPATH') || exit;
 
-add_action(
-    'before_woocommerce_init',
-    function () {
-        if (class_exists('\Automattic\WooCommerce\Utilities\FeaturesUtil')) {
-            \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
-        }
-    }
-);
+add_action('plugins_loaded', 'init_woocommerce_multi_payment_gateway', 0);
 
 function init_woocommerce_multi_payment_gateway()
 {
@@ -28,11 +23,9 @@ function init_woocommerce_multi_payment_gateway()
         return;
     }
 
-    load_plugin_textdomain('woo-multi-payment-gateway', false, dirname(plugin_basename(__FILE__)) . '/lang');
-
     class WooCommerce_Multi_Payment_Gateway extends WC_Payment_Gateway
     {
-        protected $encryption_key;
+        protected $site_secret;
         protected $payment_url;
         protected $currency;
         protected $debug;
@@ -40,7 +33,7 @@ function init_woocommerce_multi_payment_gateway()
 
         public function __construct()
         {
-            $this->id = 'multi-payment-gateway';
+            $this->id = 'multi_payment_gateway';
             $this->method_title = __('Multi Payment Gateway', 'woo-multi-payment-gateway');
             $this->has_fields = false;
 
@@ -49,7 +42,7 @@ function init_woocommerce_multi_payment_gateway()
 
             $this->title = $this->get_option('title');
             $this->description = $this->get_option('description');
-            $this->encryption_key = $this->get_option('encryption_key');
+            $this->site_secret = $this->get_option('site_secret');
             $this->payment_url = rtrim($this->get_option('payment_url'), '/') . '/';
             $this->currency = get_woocommerce_currency();
             $this->debug = 'yes' === $this->get_option('debug', 'no');
@@ -58,6 +51,11 @@ function init_woocommerce_multi_payment_gateway()
                 $this->log = wc_get_logger();
             }
 
+            $this->init_hooks();
+        }
+
+        private function init_hooks()
+        {
             add_action('woocommerce_update_options_payment_gateways_' . $this->id, array($this, 'process_admin_options'));
             add_action('woocommerce_receipt_' . $this->id, array($this, 'receipt_page'));
             add_action('woocommerce_api_wc_multi_payment_gateway', array($this, 'webhook_response'));
@@ -91,10 +89,10 @@ function init_woocommerce_multi_payment_gateway()
                     'description' => __('This is the payment URL of the Multi Payment Gateway. (Example: http://example.com/multi-payment-gateway/)', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
-                'encryption_key' => array(
-                    'title' => __('Encryption Key', 'woo-multi-payment-gateway'),
+                'site_secret' => array(
+                    'title' => __('Site Secret', 'woo-multi-payment-gateway'),
                     'type' => 'text',
-                    'description' => __('This is your Multi Payment Gateway encryption key.', 'woo-multi-payment-gateway'),
+                    'description' => __('This is your Multi Payment Gateway site secret.', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
                 'debug' => array(
@@ -106,102 +104,213 @@ function init_woocommerce_multi_payment_gateway()
             );
         }
 
-        public function admin_options()
-        {
-            echo '<h2>' . esc_html__('Multi Payment Gateway', 'woo-multi-payment-gateway') . '</h2>';
-            echo '<p>' . esc_html__('Multi Payment Gateway works by sending the user to the payment gateway to enter their payment information.', 'woo-multi-payment-gateway') . '</p>';
-            echo '<table class="form-table">';
-            $this->generate_settings_html();
-            echo '</table>';
-        }
-
-        public function receipt_page($order_id)
+        public function process_payment($order_id)
         {
             $order = wc_get_order($order_id);
-
-            if ($order) {
-                $amount = $order->get_total();
-                $email = $order->get_billing_email();
-                $cancelurl = $order->get_cancel_order_url();
-                $returnurl = $this->get_return_url($order);
-                $ipnurl = str_replace('https:', 'http:', add_query_arg('wc-api', 'wc_multi_payment_gateway', home_url('/')));
-
-                $this->create_payment_session($amount, $email, $order_id, $returnurl, $cancelurl, $ipnurl);
+            if (!$order) {
+                return;
             }
-        }
 
-        public function create_payment_session($amount, $email, $order_id, $returnurl, $cancelurl, $ipnurl)
-        {
-            $payment_session_url = $this->payment_url . 'create-payment-session.php';
+            // Sanitize and validate inputs
+            $amount = floatval($order->get_total());
+            $email = sanitize_email($order->get_billing_email());
+            $cancelurl = esc_url($order->get_cancel_order_url());
+            $returnurl = esc_url($this->get_return_url($order));
+            $ipnurl = esc_url(str_replace('https:', 'http:', add_query_arg('wc-api', 'wc_multi_payment_gateway', home_url('/'))));
+
+            if ($this->debug) {
+                $this->log->debug('Creating Payment Session', array(
+                    'source' => 'woocommerce-multi-payment-gateway',
+                    'amount' => $amount,
+                    'email' => $email,
+                    'order_id' => $order_id,
+                    'return_url' => $returnurl,
+                    'cancel_url' => $cancelurl,
+                    'ipn_url' => $ipnurl
+                ));
+            }
+
+            $payment_session_url = $this->payment_url . 'api/v1/sessions/create';
 
             $hashData = array(
-                'amount' => $amount,
+                'amount' => intval($amount * 100), // Convert to cents
                 'currency' => $this->currency,
                 'email' => $email,
-                'custominvoiceid' => $order_id,
-                'returnurl' => $returnurl,
-                'cancelurl' => $cancelurl,
-                'ipnurl' => $ipnurl,
+                'customInvoiceId' => (string) $order_id,
+                'returnUrl' => $returnurl,
+                'cancelUrl' => $cancelurl,
+                'ipnUrl' => $ipnurl,
             );
 
-            ksort($hashData);
-
-            $hashString = implode('', $hashData);
-
-            $computedHash = hash_hmac('sha256', $hashString, $this->encryption_key);
-
-            $hashData['hash'] = $computedHash;
+            if ($this->debug) {
+                $this->log->debug('Preparing to send request', array(
+                    'source' => 'woocommerce-multi-payment-gateway',
+                    'url' => $payment_session_url,
+                    'parameters' => $hashData
+                ));
+            }
 
             $response = wp_remote_post(
                 $payment_session_url,
                 array(
-                    'body' => $hashData,
+                    'headers' => array(
+                        'Content-Type' => 'application/json',
+                        'Site-Secret' => $this->site_secret,
+                    ),
+                    'body' => json_encode($hashData),
                 )
             );
 
             if ($this->debug) {
-                $this->log->debug('Outgoing Request parameters: ' . print_r($hashData, true) . ' URL: ' . $payment_session_url, array('source' => 'woocommerce-multi-payment-gateway'));
+                $this->log->debug('Received response', array(
+                    'source' => 'woocommerce-multi-payment-gateway',
+                    'response' => $response
+                ));
             }
 
-            if (!is_wp_error($response) && 201 === wp_remote_retrieve_response_code($response)) {
-                $response_body = json_decode(wp_remote_retrieve_body($response), true);
-
-                if (isset($response_body['sid'])) {
-                    $payment_url = $this->payment_url . 'index.php?sid=' . $response_body['sid'];
-
-                    wp_redirect($payment_url);
-                    exit;
+            if (is_wp_error($response)) {
+                $error_message = $response->get_error_message();
+                if ($this->debug) {
+                    $this->log->error('Request Error', array(
+                        'source' => 'woocommerce-multi-payment-gateway',
+                        'error_message' => $error_message
+                    ));
                 }
+                wc_add_notice(__('Payment session creation failed. Error: ', 'woo-multi-payment-gateway') . $error_message, 'error');
+                return array(
+                    'result' => 'failure',
+                    'redirect' => $cancelurl
+                );
             }
 
-            if ($this->debug) {
-                $this->log->debug('Outgoing Request failed: Response: ' . print_r($response, true) . ' URL: ' . $payment_session_url, array('source' => 'woocommerce-multi-payment-gateway'));
+            $response_code = wp_remote_retrieve_response_code($response);
+            if (406 === $response_code) {
+                $response_body = json_decode(wp_remote_retrieve_body($response), true);
+                $error_message = $response_body['error'] ?? __('an unexpected error', 'woo-multi-payment-gateway');
+                wc_add_notice(__('Payment session creation failed. Error: ', 'woo-multi-payment-gateway') . $error_message, 'error');
+
+                // Cancel the order
+                $order->update_status('cancelled', __('Order cancelled due to payment gateway error. Reason: ', 'woo-multi-payment-gateway') . $error_message);
+
+                return array(
+                    'result' => 'failure',
+                    'redirect' => $cancelurl
+                );
+            } elseif (200 !== $response_code) {
+                if ($this->debug) {
+                    $this->log->error('Unexpected Response Code', array(
+                        'source' => 'woocommerce-multi-payment-gateway',
+                        'response_code' => $response_code
+                    ));
+                }
+                wc_add_notice(__('Payment session creation failed due to an unexpected response from the payment gateway.', 'woo-multi-payment-gateway'), 'error');
+
+                return array(
+                    'result' => 'failure',
+                    'redirect' => $cancelurl
+                );
             }
 
             $response_body = json_decode(wp_remote_retrieve_body($response), true);
+
+            if ($this->debug) {
+                $this->log->debug('Decoded response body', array(
+                    'source' => 'woocommerce-multi-payment-gateway',
+                    'response_body' => $response_body
+                ));
+            }
+
+            if (isset($response_body['paymentUrl'])) {
+                return array(
+                    'result' => 'success',
+                    'redirect' => $response_body['paymentUrl']
+                );
+            }
+
+            if ($this->debug) {
+                $this->log->error('Invalid Response', array(
+                    'source' => 'woocommerce-multi-payment-gateway',
+                    'response_body' => $response_body
+                ));
+            }
+
             wc_add_notice(__('Payment session creation failed. Reason: ', 'woo-multi-payment-gateway') . $response_body['error'], 'error');
-            wp_redirect($cancelurl);
-            exit;
+            return array(
+                'result' => 'failure',
+                'redirect' => $cancelurl
+            );
         }
 
-        public function process_payment($order_id)
+        public function receipt_page($order_id)
         {
-            $order = wc_get_order($order_id);
+            echo '<p>' . __('Thank you for your order, please click the button below to pay.', 'woo-multi-payment-gateway') . '</p>';
+            echo '<a class="button alt" href="' . esc_url($this->get_return_url(wc_get_order($order_id))) . '">' . __('Pay Now', 'woo-multi-payment-gateway') . '</a>';
+        }
 
-            $order->update_status('pending', __('Awaiting payment', 'woo-multi-payment-gateway'));
+        public function webhook_response()
+        {
+            $appSecret = $this->site_secret;
 
-            wc()->cart->empty_cart();
+            // Validate JSON input
+            $raw_body = file_get_contents('php://input');
+            $parsed_request = json_decode($raw_body, true);
+            if (json_last_error() !== JSON_ERROR_NONE || !is_array($parsed_request)) {
+                status_header(400);
+                exit("Invalid JSON");
+            }
 
-            return array(
-                'result' => 'success',
-                'redirect' => $order->get_checkout_payment_url(true)
+            $received_hash = $_SERVER['HTTP_X_SIGNATURE'] ?? null;
+            if (!$received_hash) {
+                status_header(400);
+                exit("Missing X-Signature header");
+            }
+
+            $hashData = array(
+                'status' => $parsed_request['status'],
+                'transactionId' => $parsed_request['transactionId'],
+                'customInvoiceId' => $parsed_request['customInvoiceId'],
             );
+
+            ksort($hashData);
+            $hashString = json_encode($hashData);
+            $computedHash = hash_hmac('sha256', $hashString, $appSecret);
+
+            if (!hash_equals($computedHash, $received_hash)) {
+                status_header(400);
+                exit("Invalid signature");
+            }
+
+            $order = wc_get_order($parsed_request['customInvoiceId']);
+            if (!$order) {
+                status_header(404);
+                exit("Order not found");
+            }
+
+            switch ($parsed_request['status']) {
+                case "0":
+                    $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                    break;
+                case "1":
+                    //$order->payment_complete();
+                    //$order->add_order_note(sprintf(__('Payment completed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                    $order->update_status('completed', sprintf(__('Payment completed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                    break;
+                case "2":
+                    $order->update_status('failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                    break;
+                case "4":
+                    $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                    break;
+            }
+
+            status_header(200);
+            exit("OK");
         }
 
         public function validate_order_status($order_id)
         {
             if (isset($_REQUEST['status']) && !empty($_REQUEST['status'])) {
-                $appSecret = $this->encryption_key;
+                $appSecret = $this->site_secret;
 
                 if ($this->isValidHash($_REQUEST, $appSecret)) {
                     $status = $_REQUEST['status'];
@@ -245,54 +354,6 @@ function init_woocommerce_multi_payment_gateway()
             }
         }
 
-        public function webhook_response()
-        {
-            $appSecret = $this->encryption_key;
-
-            if ($this->isValidHash($_REQUEST, $appSecret)) {
-                $status = $_REQUEST['status'];
-                $transactionid = $_REQUEST['transactionid'];
-                $custominvoiceid = $_REQUEST['custominvoiceid'];
-
-                if ($this->debug) {
-                    $this->log->debug('Incoming Request parameters (webhook_response): ' . print_r($_REQUEST, true), array('source' => 'woocommerce-multi-payment-gateway'));
-                }
-
-                $order = wc_get_order($custominvoiceid);
-
-                switch ($status) {
-                    case "0":
-                        $order->update_status('on-hold', sprintf(__('Multi Payment Gateway payment pending. Transaction ID: %s', 'woo-multi-payment-gateway'), $transactionid));
-                        $order->reduce_order_stock();
-                        wc()->cart->empty_cart();
-                        break;
-                    case "1":
-                        $order->add_order_note(sprintf(__('Multi Payment Gateway payment completed. Transaction ID: %s', 'woo-multi-payment-gateway'), $transactionid));
-                        $order->payment_complete();
-                        break;
-                    case "2":
-                        $order->add_order_note(sprintf(__('Multi Payment Gateway payment failed. Transaction ID: %s', 'woo-multi-payment-gateway'), $transactionid));
-                        $order->update_status('failed');
-                        break;
-                    case "3":
-                        $order->update_status('refunded', sprintf(__('Multi Payment Gateway payment refund received. Transaction ID: %s', 'woo-multi-payment-gateway'), $transactionid));
-                        break;
-                    case "4":
-                        $order->update_status('refunded', sprintf(__('Multi Payment Gateway payment chargeback received. Transaction ID: %s', 'woo-multi-payment-gateway'), $transactionid));
-                        break;
-                }
-                status_header(200);
-                exit("OK");
-            } else {
-                if ($this->debug) {
-                    $this->log->debug('isValidHash false $_REQUEST: ' . print_r($_REQUEST, true) . ' $appSecret: ' . $appSecret, array('source' => 'woocommerce-multi-payment-gateway'));
-                }
-                // Return error response 
-                status_header(400); // Bad Request 
-                exit("Invalid request");
-            }
-        }
-
         public function isValidHash($data, $appSecret)
         {
             $hashData = array(
@@ -319,3 +380,10 @@ function init_woocommerce_multi_payment_gateway()
 
     add_filter('woocommerce_payment_gateways', 'add_multi_payment_gateway');
 }
+
+// Declare compatibility with HPOS
+add_action('before_woocommerce_init', function () {
+    if (class_exists(\Automattic\WooCommerce\Utilities\FeaturesUtil::class)) {
+        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility('custom_order_tables', __FILE__, true);
+    }
+});
