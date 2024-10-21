@@ -26,7 +26,7 @@ function init_woocommerce_multi_payment_gateway()
     class WooCommerce_Multi_Payment_Gateway extends WC_Payment_Gateway
     {
         protected $site_secret;
-        protected $payment_url;
+        protected $mpg_main_backend_domain;
         protected $currency;
         protected $debug;
         protected $log;
@@ -43,7 +43,7 @@ function init_woocommerce_multi_payment_gateway()
             $this->title = $this->get_option('title');
             $this->description = $this->get_option('description');
             $this->site_secret = $this->get_option('site_secret');
-            $this->payment_url = rtrim($this->get_option('payment_url'), '/') . '/';
+            $this->mpg_main_backend_domain = rtrim($this->get_option('mpg_main_backend_domain'), '/') . '/';
             $this->currency = get_woocommerce_currency();
             $this->debug = 'yes' === $this->get_option('debug', 'no');
 
@@ -83,10 +83,10 @@ function init_woocommerce_multi_payment_gateway()
                     'description' => __('This controls the description which the user sees during checkout.', 'woo-multi-payment-gateway'),
                     'default' => __('Pay securely with your credit card, debit card or bank account.', 'woo-multi-payment-gateway')
                 ),
-                'payment_url' => array(
-                    'title' => __('Payment System URL', 'woo-multi-payment-gateway'),
+                'mpg_main_backend_domain' => array(
+                    'title' => __('Default Multi Payment Gateway Main Backend Domain', 'woo-multi-payment-gateway'),
                     'type' => 'text',
-                    'description' => __('This is the payment URL of the Multi Payment Gateway. (Example: http://example.com/multi-payment-gateway/)', 'woo-multi-payment-gateway'),
+                    'description' => __('Enter the main backend domain for your Multi Payment Gateway site configuration without the protocol. For example, use "example.com" instead of "https://example.com".', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
                 'site_secret' => array(
@@ -130,7 +130,7 @@ function init_woocommerce_multi_payment_gateway()
                 ));
             }
 
-            $payment_session_url = $this->payment_url . 'api/v1/sessions/create';
+            $payment_session_url = 'https://' . $this->mpg_main_backend_domain . 'api/v1/sessions/create';
 
             $hashData = array(
                 'amount' => intval($amount * 100), // Convert to cents
