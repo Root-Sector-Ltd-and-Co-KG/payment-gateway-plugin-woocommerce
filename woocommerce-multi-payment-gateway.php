@@ -84,7 +84,7 @@ function init_woocommerce_multi_payment_gateway()
                     'default' => __('Pay securely with your credit card, debit card or bank account.', 'woo-multi-payment-gateway')
                 ),
                 'mpg_main_backend_domain' => array(
-                    'title' => __('Default Multi Payment Gateway Main Backend Domain', 'woo-multi-payment-gateway'),
+                    'title' => __('Default Main Backend Domain', 'woo-multi-payment-gateway'),
                     'type' => 'text',
                     'description' => __('Enter the main backend domain for your Multi Payment Gateway site configuration without the protocol. For example, use "example.com" instead of "https://example.com".', 'woo-multi-payment-gateway'),
                     'default' => ''
