@@ -112,7 +112,7 @@ function init_woocommerce_multi_payment_gateway()
             }
 
             // Sanitize and validate inputs
-            $amount = floatval($order->get_total());
+            $amount = round($invoice->first_total * 100); // Convert to cents
             $email = sanitize_email($order->get_billing_email());
             $cancelurl = esc_url($order->get_cancel_order_url());
             $returnurl = esc_url($this->get_return_url($order));
@@ -133,7 +133,7 @@ function init_woocommerce_multi_payment_gateway()
             $payment_session_url = 'https://' . $this->mpg_main_backend_domain . 'api/v1/sessions/create';
 
             $hashData = array(
-                'amount' => intval($amount * 100), // Convert to cents
+                'amount' => $amount,
                 'currency' => $this->currency,
                 'email' => $email,
                 'customInvoiceId' => (string) $order_id,
