@@ -25,7 +25,7 @@ function init_woocommerce_multi_payment_gateway()
 
     class WooCommerce_Multi_Payment_Gateway extends WC_Payment_Gateway
     {
-        protected $site_secret;
+        protected $site_secret_key;
         protected $mpg_main_backend_domain;
         protected $currency;
         protected $debug;
@@ -42,7 +42,7 @@ function init_woocommerce_multi_payment_gateway()
 
             $this->title = $this->get_option('title');
             $this->description = $this->get_option('description');
-            $this->site_secret = $this->get_option('site_secret');
+            $this->site_secret_key = $this->get_option('site_secret_key');
             $this->mpg_main_backend_domain = rtrim($this->get_option('mpg_main_backend_domain'), '/') . '/';
             $this->currency = get_woocommerce_currency();
             $this->debug = 'yes' === $this->get_option('debug', 'no');
@@ -86,13 +86,13 @@ function init_woocommerce_multi_payment_gateway()
                 'mpg_main_backend_domain' => array(
                     'title' => __('Default Main Backend Domain', 'woo-multi-payment-gateway'),
                     'type' => 'text',
-                    'description' => __('Enter the main backend domain for your Multi Payment Gateway site configuration without the protocol. For example, use "example.com" instead of "https://example.com".', 'woo-multi-payment-gateway'),
+                    'description' => __('Your Multi Payment Gateway main backend domain without the protocol. For example, use "example.com" instead of "https://example.com".', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
-                'site_secret' => array(
-                    'title' => __('Site Secret', 'woo-multi-payment-gateway'),
+                'site_secret_key' => array(
+                    'title' => __('Site Secret Key', 'woo-multi-payment-gateway'),
                     'type' => 'text',
-                    'description' => __('This is your Multi Payment Gateway site secret.', 'woo-multi-payment-gateway'),
+                    'description' => __('Your Multi Payment Gateway site secret key.', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
                 'debug' => array(
@@ -155,7 +155,7 @@ function init_woocommerce_multi_payment_gateway()
                 array(
                     'headers' => array(
                         'Content-Type' => 'application/json',
-                        'Site-Secret' => $this->site_secret,
+                        'Site-Secret-Key' => $this->site_secret_key,
                     ),
                     'body' => json_encode($hashData),
                 )
@@ -249,7 +249,7 @@ function init_woocommerce_multi_payment_gateway()
 
         public function webhook_response()
         {
-            $appSecret = $this->site_secret;
+            $appSecret = $this->site_secret_key;
 
             // Validate JSON input
             $raw_body = file_get_contents('php://input');
@@ -310,7 +310,7 @@ function init_woocommerce_multi_payment_gateway()
         public function validate_order_status($order_id)
         {
             if (isset($_REQUEST['status']) && !empty($_REQUEST['status'])) {
-                $appSecret = $this->site_secret;
+                $appSecret = $this->site_secret_key;
 
                 if ($this->isValidHash($_REQUEST, $appSecret)) {
                     $status = $_REQUEST['status'];
