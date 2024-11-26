@@ -27,6 +27,10 @@ This plugin requires a multi-payment-gateway installation.
 
 == Changelog ==
 
+= 1.0.1 =
+
+- Fix: Get order total from WooCommerce order object and convert to cents
+
 = 1.0.0 =
 
 - Released: Initial version of the software.
