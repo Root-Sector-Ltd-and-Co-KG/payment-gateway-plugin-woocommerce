@@ -2,7 +2,7 @@
 Contributors: r00tsector
 Tags: payment gateway, credit card, direct debit, stripe, gocardless, coinbasecommerce
 Requires at least: 6.1
-Tested up to: 6.5.3
+Tested up to: 6.7.1
 Requires PHP: 8.1
 Stable tag: 1.0.0
 License: GPLv3
@@ -28,4 +28,5 @@ This plugin requires a multi-payment-gateway installation.
 == Changelog ==
 
 = 1.0.0 =
-* Released: Initial version of the software.
+
+- Released: Initial version of the software.
