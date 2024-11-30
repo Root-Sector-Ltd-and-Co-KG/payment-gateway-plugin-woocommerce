@@ -116,7 +116,7 @@ function init_woocommerce_multi_payment_gateway()
             $email = sanitize_email($order->get_billing_email());
             $cancelurl = esc_url($order->get_cancel_order_url());
             $returnurl = esc_url($this->get_return_url($order));
-            $ipnurl = esc_url(str_replace('https:', 'http:', add_query_arg('wc-api', 'wc_multi_payment_gateway', home_url('/'))));
+            $ipnurl = esc_url(add_query_arg('wc-api', 'wc_multi_payment_gateway', home_url('/', 'https')));
 
             if ($this->debug) {
                 $this->log->debug('Creating Payment Session', array(
@@ -249,18 +249,41 @@ function init_woocommerce_multi_payment_gateway()
 
         public function webhook_response()
         {
+            if ($this->debug) {
+                $this->log->debug('Incoming webhook request', array(
+                    'source' => 'woocommerce-multi-payment-gateway',
+                    'headers' => getallheaders(),
+                    'raw_body' => file_get_contents('php://input'),
+                    'method' => $_SERVER['REQUEST_METHOD'],
+                    'query_params' => $_GET
+                ));
+            }
+
             $appSecret = $this->site_secret_key;
 
             // Validate JSON input
             $raw_body = file_get_contents('php://input');
             $parsed_request = json_decode($raw_body, true);
             if (json_last_error() !== JSON_ERROR_NONE || !is_array($parsed_request)) {
+                if ($this->debug) {
+                    $this->log->error('Invalid JSON in webhook request', array(
+                        'source' => 'woocommerce-multi-payment-gateway',
+                        'raw_body' => $raw_body,
+                        'json_error' => json_last_error_msg()
+                    ));
+                }
                 status_header(400);
                 exit("Invalid JSON");
             }
 
             $received_hash = $_SERVER['HTTP_X_SIGNATURE'] ?? null;
             if (!$received_hash) {
+                if ($this->debug) {
+                    $this->log->error('Missing X-Signature header', array(
+                        'source' => 'woocommerce-multi-payment-gateway',
+                        'headers' => getallheaders()
+                    ));
+                }
                 status_header(400);
                 exit("Missing X-Signature header");
             }
