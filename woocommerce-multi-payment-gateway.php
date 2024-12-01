@@ -314,12 +314,13 @@ function init_woocommerce_multi_payment_gateway()
                     $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
                     break;
                 case "1":
-                    //$order->payment_complete();
-                    //$order->add_order_note(sprintf(__('Payment completed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
                     $order->update_status('completed', sprintf(__('Payment completed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
                     break;
                 case "2":
                     $order->update_status('failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                    break;
+                case "3":
+                    $order->update_status('refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
                     break;
                 case "4":
                     $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
@@ -359,7 +360,7 @@ function init_woocommerce_multi_payment_gateway()
                             wp_redirect($order->get_cancel_order_url());
                             break;
                         case "3":
-                            $order->update_status('refunded');
+                            $order->update_status('refunded', __('Payment refunded', 'woo-multi-payment-gateway'));
                             wp_redirect($order->get_cancel_order_url());
                             break;
                         case "4":
