@@ -100,7 +100,25 @@ function init_woocommerce_multi_payment_gateway()
                     'type' => 'checkbox',
                     'description' => __('Enable logging of incoming and outgoing requests.', 'woo-multi-payment-gateway'),
                     'default' => 'no'
-                )
+                ),
+                'pass_billing_address' => array(
+                    'title' => __('Pass Billing Address', 'woo-multi-payment-gateway'),
+                    'type' => 'checkbox',
+                    'label' => __('Enable passing billing address', 'woo-multi-payment-gateway'),
+                    'default' => 'yes'
+                ),
+                'pass_shipping_address' => array(
+                    'title' => __('Pass Shipping Address', 'woo-multi-payment-gateway'),
+                    'type' => 'checkbox',
+                    'label' => __('Enable passing shipping address', 'woo-multi-payment-gateway'),
+                    'default' => 'yes'
+                ),
+                'pass_items' => array(
+                    'title' => __('Pass Items', 'woo-multi-payment-gateway'),
+                    'type' => 'checkbox',
+                    'label' => __('Enable passing items', 'woo-multi-payment-gateway'),
+                    'default' => 'yes'
+                ),
             );
         }
 
@@ -112,7 +130,7 @@ function init_woocommerce_multi_payment_gateway()
             }
 
             // Sanitize and validate inputs
-            $amount = round($order->get_total() * 100);
+            $amount = round($order->get_total() * 100); // Total amount including items, shipping, and tax
             $email = sanitize_email($order->get_billing_email());
             $cancelurl = esc_url($order->get_cancel_order_url());
             $returnurl = esc_url($this->get_return_url($order));
@@ -142,6 +160,73 @@ function init_woocommerce_multi_payment_gateway()
                 'ipnUrl' => $ipnurl,
             );
 
+            if ('yes' === $this->get_option('pass_billing_address')) {
+                $hashData['billingAddress'] = array(
+                    'firstName' => $order->get_billing_first_name(),
+                    'lastName' => $order->get_billing_last_name(),
+                    'address1' => $order->get_billing_address_1(),
+                    'address2' => $order->get_billing_address_2(),
+                    'city' => $order->get_billing_city(),
+                    'postcode' => $order->get_billing_postcode(),
+                    'country' => $order->get_billing_country(),
+                    'phone' => $order->get_billing_phone(),
+                );
+            }
+        
+            if ('yes' === $this->get_option('pass_shipping_address')) {
+                $hashData['shippingAddress'] = array(
+                    'firstName' => $order->get_shipping_first_name(),
+                    'lastName' => $order->get_shipping_last_name(),
+                    'address1' => $order->get_shipping_address_1(),
+                    'address2' => $order->get_shipping_address_2(),
+                    'city' => $order->get_shipping_city(),
+                    'postcode' => $order->get_shipping_postcode(),
+                    'country' => $order->get_shipping_country(),
+                );
+            }
+        
+            if ('yes' === $this->get_option('pass_items')) {
+                $items = array();
+                
+                // Add items to the array
+                foreach ($order->get_items() as $item) {
+                    $product = $item->get_product();
+                    $type = $product ? $product->get_type() : 'unknown';
+                    $is_physical = in_array($type, array('simple', 'variable', 'grouped', 'external'), true);
+                    
+                    $amount_in_cents = intval($item->get_total() * 100);
+            
+                    $items[] = array(
+                        'name' => $item->get_name(),
+                        'quantity' => $item->get_quantity(),
+                        'amount' => $amount_in_cents,
+                        'type' => $is_physical ? 'physical' : 'virtual',
+                    );
+                }
+        
+                // Add shipping cost as an item if it exists
+                if ($order->get_shipping_total() > 0) {
+                    $items[] = array(
+                        'name' => 'Shipping',
+                        'quantity' => 1,
+                        'amount' => intval($order->get_shipping_total() * 100),
+                        'type' => 'shipping',
+                    );
+                }
+        
+                // Add tax as a separate item if it exists
+                if ($order->get_total_tax() > 0) {
+                    $items[] = array(
+                        'name' => 'Tax',
+                        'quantity' => 1,
+                        'amount' => intval($order->get_total_tax() * 100),
+                        'type' => 'tax',
+                    );
+                }
+        
+                $hashData['items'] = $items;
+            }
+            
             if ($this->debug) {
                 $this->log->debug('Preparing to send request', array(
                     'source' => 'woocommerce-multi-payment-gateway',
@@ -184,34 +269,27 @@ function init_woocommerce_multi_payment_gateway()
             }
 
             $response_code = wp_remote_retrieve_response_code($response);
-            if (406 === $response_code) {
-                $response_body = json_decode(wp_remote_retrieve_body($response), true);
-                $error_message = $response_body['error'] ?? __('an unexpected error', 'woo-multi-payment-gateway');
+            $response_body = json_decode(wp_remote_retrieve_body($response), true);
+
+            if ($response_code !== 200) {
+                $error_message = $response_body['error'] ?? __('Payment session creation failed due to an unexpected error.', 'woo-multi-payment-gateway');
                 wc_add_notice(__('Payment session creation failed. Error: ', 'woo-multi-payment-gateway') . $error_message, 'error');
 
-                // Cancel the order
+                if ($this->debug) {
+                    $this->log->error('Unexpected Response Code', array(
+                        'source' => 'woocommerce-multi-payment-gateway',
+                        'response_code' => $response_code,
+                        'response_body' => $response_body
+                    ));
+                }
+
                 $order->update_status('cancelled', __('Order cancelled due to payment gateway error. Reason: ', 'woo-multi-payment-gateway') . $error_message);
 
                 return array(
                     'result' => 'failure',
                     'redirect' => $cancelurl
                 );
-            } elseif (200 !== $response_code) {
-                if ($this->debug) {
-                    $this->log->error('Unexpected Response Code', array(
-                        'source' => 'woocommerce-multi-payment-gateway',
-                        'response_code' => $response_code
-                    ));
-                }
-                wc_add_notice(__('Payment session creation failed due to an unexpected response from the payment gateway.', 'woo-multi-payment-gateway'), 'error');
-
-                return array(
-                    'result' => 'failure',
-                    'redirect' => $cancelurl
-                );
             }
-
-            $response_body = json_decode(wp_remote_retrieve_body($response), true);
 
             if ($this->debug) {
                 $this->log->debug('Decoded response body', array(
@@ -234,8 +312,8 @@ function init_woocommerce_multi_payment_gateway()
                 ));
             }
 
-            wc_add_notice(__('Payment session creation failed. Reason: ', 'woo-multi-payment-gateway') . $response_body['error'], 'error');
-            return array(
+            $error_message = $response_body['error'] ?? __('an unexpected error occurred', 'woo-multi-payment-gateway');
+            wc_add_notice(__('Payment session creation failed. Reason: ', 'woo-multi-payment-gateway') . $error_message, 'error');            return array(
                 'result' => 'failure',
                 'redirect' => $cancelurl
             );
