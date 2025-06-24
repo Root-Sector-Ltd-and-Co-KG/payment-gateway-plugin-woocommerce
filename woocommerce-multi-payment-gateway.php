@@ -3,13 +3,13 @@
  * Plugin Name: WooCommerce Multi Payment Gateway
  * Plugin URI: https://root-sector.com
  * Description: WooCommerce Multi Payment Gateway Extension.
- * Version: 1.0.0
+ * Version: 1.0.2
  * Requires at least: 6.4
  * Requires PHP: 8.1
  * Author: Root Sector Ltd. & Co. KG
  * Author URI: https://root-sector.com
  * WC requires at least: 9.2
- * WC tested up to: 9.2
+ * WC tested up to: 9.9
  * License: GPLv3
  * License URI: https://www.gnu.org/licenses/gpl-3.0.html
  */
@@ -86,37 +86,40 @@ function init_woocommerce_multi_payment_gateway()
                 'mpg_main_backend_domain' => array(
                     'title' => __('Default Main Backend Domain', 'woo-multi-payment-gateway'),
                     'type' => 'text',
-                    'description' => __('Your Multi Payment Gateway main backend domain without the protocol. For example, use "example.com" instead of "https://example.com".', 'woo-multi-payment-gateway'),
+                    'description' => __('Enter the domain of your Multi Payment Gateway main backend instance. Do not include "https://". For example: <code>api.your-gateway.com</code>', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
                 'site_secret_key' => array(
                     'title' => __('Site Secret Key', 'woo-multi-payment-gateway'),
-                    'type' => 'text',
-                    'description' => __('Your Multi Payment Gateway site secret key.', 'woo-multi-payment-gateway'),
+                    'type' => 'password',
+                    'description' => __('Enter the Secret Key for the site you configured in your Multi Payment Gateway admin panel under Sites. This is used to authenticate requests.', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
                 'debug' => array(
                     'title' => __('Debug Log', 'woo-multi-payment-gateway'),
                     'type' => 'checkbox',
-                    'description' => __('Enable logging of incoming and outgoing requests.', 'woo-multi-payment-gateway'),
+                    'description' => __('Enable logging of incoming and outgoing requests to the WooCommerce logs. Useful for troubleshooting.', 'woo-multi-payment-gateway'),
                     'default' => 'no'
                 ),
                 'pass_billing_address' => array(
                     'title' => __('Pass Billing Address', 'woo-multi-payment-gateway'),
                     'type' => 'checkbox',
                     'label' => __('Enable passing billing address', 'woo-multi-payment-gateway'),
+                    'description' => __('If enabled, the customer\'s billing address will be sent to the payment gateway. This can be useful for fraud detection.', 'woo-multi-payment-gateway'),
                     'default' => 'yes'
                 ),
                 'pass_shipping_address' => array(
                     'title' => __('Pass Shipping Address', 'woo-multi-payment-gateway'),
                     'type' => 'checkbox',
                     'label' => __('Enable passing shipping address', 'woo-multi-payment-gateway'),
+                    'description' => __('If enabled, the customer\'s shipping address will be sent to the payment gateway.', 'woo-multi-payment-gateway'),
                     'default' => 'yes'
                 ),
                 'pass_items' => array(
                     'title' => __('Pass Items', 'woo-multi-payment-gateway'),
                     'type' => 'checkbox',
                     'label' => __('Enable passing items', 'woo-multi-payment-gateway'),
+                    'description' => __('If enabled, the individual items in the cart will be sent to the payment gateway.', 'woo-multi-payment-gateway'),
                     'default' => 'yes'
                 ),
             );
@@ -191,8 +194,9 @@ function init_woocommerce_multi_payment_gateway()
                 // Add items to the array
                 foreach ($order->get_items() as $item) {
                     $product = $item->get_product();
-                    $type = $product ? $product->get_type() : 'unknown';
-                    $is_physical = in_array($type, array('simple', 'variable', 'grouped', 'external'), true);
+
+                    // A product is virtual if it's not physical and doesn't require shipping.
+                    $item_type = ($product && $product->is_virtual()) ? 'virtual' : 'physical';
                     
                     $amount_in_cents = intval($item->get_total() * 100);
             
@@ -200,7 +204,7 @@ function init_woocommerce_multi_payment_gateway()
                         'name' => $item->get_name(),
                         'quantity' => $item->get_quantity(),
                         'amount' => $amount_in_cents,
-                        'type' => $is_physical ? 'physical' : 'virtual',
+                        'type' => $item_type,
                     );
                 }
         
