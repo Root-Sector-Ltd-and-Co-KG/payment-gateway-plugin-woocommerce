@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Multi Payment Gateway
  * Plugin URI: https://root-sector.com
  * Description: WooCommerce Multi Payment Gateway Extension.
- * Version: 1.0.2
+ * Version: 1.0.3
  * Requires at least: 6.4
  * Requires PHP: 8.1
  * Author: Root Sector Ltd. & Co. KG
@@ -153,9 +153,13 @@ function init_woocommerce_multi_payment_gateway()
 
             $payment_session_url = 'https://' . $this->mpg_main_backend_domain . 'api/v1/sessions/create';
 
+            if ($this->debug) {
+                $this->log->debug('Preparing hashData', array('source' => 'woocommerce-multi-payment-gateway', 'order_id' => $order_id));
+            }
+
             $hashData = array(
-                'amount' => $amount,
-                'currency' => $this->currency,
+                'amount' => round($order->get_total() * 100), // Amount in cents
+                'currency' => get_woocommerce_currency(),
                 'email' => $email,
                 'customInvoiceId' => (string) $order_id,
                 'returnUrl' => $returnurl,
@@ -190,44 +194,65 @@ function init_woocommerce_multi_payment_gateway()
         
             if ('yes' === $this->get_option('pass_items')) {
                 $items = array();
-                
-                // Add items to the array
+
+                // Product items
                 foreach ($order->get_items() as $item) {
                     $product = $item->get_product();
-
-                    // A product is virtual if it's not physical and doesn't require shipping.
                     $item_type = ($product && $product->is_virtual()) ? 'virtual' : 'physical';
-                    
-                    $amount_in_cents = intval($item->get_total() * 100);
-            
                     $items[] = array(
-                        'name' => $item->get_name(),
+                        'name'     => $item->get_name(),
                         'quantity' => $item->get_quantity(),
-                        'amount' => $amount_in_cents,
-                        'type' => $item_type,
+                        'amount'   => round(($item->get_subtotal() / $item->get_quantity()) * 100),
+                        'type'     => $item_type
                     );
                 }
-        
-                // Add shipping cost as an item if it exists
+    
+                // Shipping item
                 if ($order->get_shipping_total() > 0) {
                     $items[] = array(
-                        'name' => 'Shipping',
+                        'name'     => 'Shipping',
                         'quantity' => 1,
-                        'amount' => intval($order->get_shipping_total() * 100),
-                        'type' => 'shipping',
+                        'amount'   => round($order->get_shipping_total() * 100),
+                        'type'     => 'shipping'
                     );
                 }
-        
-                // Add tax as a separate item if it exists
+    
+                // Tax item
                 if ($order->get_total_tax() > 0) {
                     $items[] = array(
-                        'name' => 'Tax',
+                        'name'     => 'Tax',
                         'quantity' => 1,
-                        'amount' => intval($order->get_total_tax() * 100),
-                        'type' => 'tax',
+                        'amount'   => round($order->get_total_tax() * 100),
+                        'type'     => 'tax'
                     );
                 }
-        
+    
+                // Correct for rounding errors by ensuring the sum of items exactly equals the order total.
+                $items_total_cents = 0;
+                foreach ($items as $item) {
+                    $items_total_cents += $item['amount'] * $item['quantity'];
+                }
+    
+                $total_cents = round($order->get_total() * 100);
+                $diff_cents = $total_cents - $items_total_cents;
+    
+                if ($diff_cents != 0) {
+                    // Find the tax item and adjust it. If no tax item, adjust the last item.
+                    $adjusted = false;
+                    for ($i = 0; $i < count($items); $i++) {
+                        if ($items[$i]['type'] === 'tax') {
+                            $items[$i]['amount'] += $diff_cents;
+                            $adjusted = true;
+                            break;
+                        }
+                    }
+    
+                    // If no tax item was found, adjust the last item in the array.
+                    if (!$adjusted && count($items) > 0) {
+                        $items[count($items) - 1]['amount'] += $diff_cents;
+                    }
+                }
+    
                 $hashData['items'] = $items;
             }
             
@@ -277,6 +302,17 @@ function init_woocommerce_multi_payment_gateway()
 
             if ($response_code !== 200) {
                 $error_message = $response_body['error'] ?? __('Payment session creation failed due to an unexpected error.', 'woo-multi-payment-gateway');
+
+                // Check for the specific rounding error and provide a more user-friendly message.
+                if (strpos($error_message, 'sum of item amounts') !== false && strpos($error_message, 'does not match total amount') !== false) {
+                    $error_message = __('The total amount of the items does not match the order total. This can be caused by a rounding difference. Please contact support for assistance.', 'woo-multi-payment-gateway');
+                }
+
+                // Append the request ID for debugging purposes if it exists.
+                if (isset($response_body['request_id'])) {
+                    $error_message .= ' (Request-ID: ' . esc_html($response_body['request_id']) . ')';
+                }
+
                 wc_add_notice(__('Payment session creation failed. Error: ', 'woo-multi-payment-gateway') . $error_message, 'error');
 
                 if ($this->debug) {
