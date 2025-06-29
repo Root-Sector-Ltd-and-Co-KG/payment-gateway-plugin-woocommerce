@@ -51,6 +51,7 @@ After installation, configure the plugin by following these steps:
     - **Default Main Backend Domain**: Enter the domain of your Multi Payment Gateway main backend instance.
       - **Important**: Do not include `https://` or a trailing slash.
       - _Example_: `api.your-gateway.com`
+    - **Site ID**: Enter the **Site ID** from your site's edit page in the Multi Payment Gateway admin panel.
     - **Site Secret Key**: Enter the **Secret Key** for the site you configured in your Multi Payment Gateway admin panel. This is used to securely authenticate requests. You can find this key in your Site's settings page within the Multi Payment Gateway admin.
     - **Debug Log**: Enable this to log all requests and responses to the WooCommerce system logs (`WooCommerce > Status > Logs`). This is very useful for troubleshooting integration issues.
     - **Pass Billing Address**: When enabled, the customer's billing address is sent to the payment gateway. This is recommended for fraud prevention and address verification (AVS).

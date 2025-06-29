@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Multi Payment Gateway
  * Plugin URI: https://root-sector.com
  * Description: WooCommerce Multi Payment Gateway Extension.
- * Version: 1.0.3
+ * Version: 1.1.0
  * Requires at least: 6.4
  * Requires PHP: 8.1
  * Author: Root Sector Ltd. & Co. KG
@@ -30,6 +30,7 @@ function init_woocommerce_multi_payment_gateway()
         protected $currency;
         protected $debug;
         protected $log;
+        protected $site_id;
 
         public function __construct()
         {
@@ -43,6 +44,7 @@ function init_woocommerce_multi_payment_gateway()
             $this->title = $this->get_option('title');
             $this->description = $this->get_option('description');
             $this->site_secret_key = $this->get_option('site_secret_key');
+            $this->site_id = $this->get_option('site_id');
             $this->mpg_main_backend_domain = rtrim($this->get_option('mpg_main_backend_domain'), '/') . '/';
             $this->currency = get_woocommerce_currency();
             $this->debug = 'yes' === $this->get_option('debug', 'no');
@@ -59,7 +61,8 @@ function init_woocommerce_multi_payment_gateway()
             add_action('woocommerce_update_options_payment_gateways_' . $this->id, array($this, 'process_admin_options'));
             add_action('woocommerce_receipt_' . $this->id, array($this, 'receipt_page'));
             add_action('woocommerce_api_wc_multi_payment_gateway', array($this, 'webhook_response'));
-            add_action('woocommerce_thankyou', array($this, 'validate_order_status'), 10, 1);
+            add_filter('woocommerce_thankyou_order_received_text', array($this, 'custom_thankyou_text'), 10, 2);
+            add_action('woocommerce_thankyou_' . $this->id, array($this, 'add_status_check_to_thankyou'), 20);
         }
 
         public function init_form_fields()
@@ -87,6 +90,12 @@ function init_woocommerce_multi_payment_gateway()
                     'title' => __('Default Main Backend Domain', 'woo-multi-payment-gateway'),
                     'type' => 'text',
                     'description' => __('Enter the domain of your Multi Payment Gateway main backend instance. Do not include "https://". For example: <code>api.your-gateway.com</code>', 'woo-multi-payment-gateway'),
+                    'default' => ''
+                ),
+                'site_id' => array(
+                    'title' => __('Site ID', 'woo-multi-payment-gateway'),
+                    'type' => 'text',
+                    'description' => __('Enter the Site ID for the site you configured in your Multi Payment Gateway admin panel. You can copy this from the site edit page.', 'woo-multi-payment-gateway'),
                     'default' => ''
                 ),
                 'site_secret_key' => array(
@@ -269,6 +278,7 @@ function init_woocommerce_multi_payment_gateway()
                 array(
                     'headers' => array(
                         'Content-Type' => 'application/json',
+                        'Site-Id' => $this->site_id,
                         'Site-Secret-Key' => $this->site_secret_key,
                     ),
                     'body' => json_encode($hashData),
@@ -379,8 +389,50 @@ function init_woocommerce_multi_payment_gateway()
 
             $appSecret = $this->site_secret_key;
 
-            // Validate JSON input
+            // --- New Webhook Verification Logic ---
+            $received_timestamp = $_SERVER['HTTP_X_SIGNATURE_TIMESTAMP'] ?? null;
+            $received_signature = $_SERVER['HTTP_X_SIGNATURE_HMAC_SHA256'] ?? null;
             $raw_body = file_get_contents('php://input');
+
+            if (!$received_timestamp || !$received_signature) {
+                if ($this->debug) {
+                    $this->log->error('Webhook signature headers missing', array('source' => 'woocommerce-multi-payment-gateway'));
+                }
+                status_header(400);
+                exit("Signature headers missing");
+            }
+
+            // Check if timestamp is recent (e.g., within 5 minutes) to prevent replay attacks.
+            if (time() - (int)$received_timestamp > 300) {
+                if ($this->debug) {
+                    $this->log->error('Webhook timestamp is too old', array(
+                        'source' => 'woocommerce-multi-payment-gateway',
+                        'received_timestamp' => $received_timestamp
+                    ));
+                }
+                status_header(400);
+                exit("Webhook timestamp too old");
+            }
+
+            // Recreate the signature string.
+            $string_to_sign = $received_timestamp . '.' . $raw_body;
+            $computed_hash = hash_hmac('sha256', $string_to_sign, $appSecret);
+
+            // Securely compare the signatures.
+            if (!hash_equals($computed_hash, $received_signature)) {
+                if ($this->debug) {
+                    $this->log->error('Invalid webhook signature', array(
+                        'source' => 'woocommerce-multi-payment-gateway',
+                        'string_to_hash' => $string_to_sign,
+                        'computed_hash' => $computed_hash,
+                        'received_signature' => $received_signature
+                    ));
+                }
+                status_header(400);
+                exit("Invalid signature");
+            }
+            // --- End New Verification Logic ---
+
             $parsed_request = json_decode($raw_body, true);
             if (json_last_error() !== JSON_ERROR_NONE || !is_array($parsed_request)) {
                 if ($this->debug) {
@@ -394,33 +446,6 @@ function init_woocommerce_multi_payment_gateway()
                 exit("Invalid JSON");
             }
 
-            $received_hash = $_SERVER['HTTP_X_SIGNATURE'] ?? null;
-            if (!$received_hash) {
-                if ($this->debug) {
-                    $this->log->error('Missing X-Signature header', array(
-                        'source' => 'woocommerce-multi-payment-gateway',
-                        'headers' => getallheaders()
-                    ));
-                }
-                status_header(400);
-                exit("Missing X-Signature header");
-            }
-
-            $hashData = array(
-                'status' => $parsed_request['status'],
-                'transactionId' => $parsed_request['transactionId'],
-                'customInvoiceId' => $parsed_request['customInvoiceId'],
-            );
-
-            ksort($hashData);
-            $hashString = json_encode($hashData);
-            $computedHash = hash_hmac('sha256', $hashString, $appSecret);
-
-            if (!hash_equals($computedHash, $received_hash)) {
-                status_header(400);
-                exit("Invalid signature");
-            }
-
             $order = wc_get_order($parsed_request['customInvoiceId']);
             if (!$order) {
                 status_header(404);
@@ -428,20 +453,26 @@ function init_woocommerce_multi_payment_gateway()
             }
 
             switch ($parsed_request['status']) {
-                case "0":
-                    $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                case 0:
+                    $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['id']));
                     break;
-                case "1":
-                    $order->update_status('completed', sprintf(__('Payment completed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                case 1:
+                    $order->update_status('completed', sprintf(__('Payment completed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['id']));
                     break;
-                case "2":
-                    $order->update_status('failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                case 2:
+                    $order->update_status('failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['id']));
                     break;
-                case "3":
-                    $order->update_status('refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                case 3:
+                    $order->update_status('refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['id']));
                     break;
-                case "4":
-                    $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['transactionId']));
+                case 4:
+                    $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['id']));
+                    break;
+                case -1:
+                    $order->update_status('on-hold', sprintf(__('Payment initiated. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['id']));
+                    break;
+                case -2:
+                    $order->update_status('cancelled', sprintf(__('Payment cancelled. Transaction ID: %s', 'woo-multi-payment-gateway'), $parsed_request['id']));
                     break;
             }
 
@@ -449,68 +480,34 @@ function init_woocommerce_multi_payment_gateway()
             exit("OK");
         }
 
-        public function validate_order_status($order_id)
+        /**
+         * Customize the thank you page message.
+         */
+        public function custom_thankyou_text($text, $order)
         {
-            if (isset($_REQUEST['status']) && !empty($_REQUEST['status'])) {
-                $appSecret = $this->site_secret_key;
-
-                if ($this->isValidHash($_REQUEST, $appSecret)) {
-                    $status = $_REQUEST['status'];
-
-                    if ($this->debug) {
-                        $this->log->debug('Incoming Request parameters (validate_order_status): ' . print_r($_REQUEST, true), array('source' => 'woocommerce-multi-payment-gateway'));
-                    }
-
-                    $order = wc_get_order($order_id);
-
-                    switch ($status) {
-                        case "0":
-                            $order->reduce_order_stock();
-                            wc()->cart->empty_cart();
-                            wp_redirect($this->get_return_url($order));
-                            break;
-                        case "1":
-                            $order->payment_complete();
-                            wp_redirect($this->get_return_url($order));
-                            break;
-                        case "2":
-                            $order->update_status('failed');
-                            wp_redirect($order->get_cancel_order_url());
-                            break;
-                        case "3":
-                            $order->update_status('refunded', __('Payment refunded', 'woo-multi-payment-gateway'));
-                            wp_redirect($order->get_cancel_order_url());
-                            break;
-                        case "4":
-                            $order->update_status('refunded');
-                            break;
-                    }
-                } else {
-                    if ($this->debug) {
-                        $this->log->debug('isValidHash false $_REQUEST: ' . print_r($_REQUEST, true) . ' $appSecret: ' . $appSecret, array('source' => 'woocommerce-multi-payment-gateway'));
-                    }
-                    wc_add_notice(__('Transaction cancelled.', 'woo-multi-payment-gateway'), 'error');
-                    wp_safe_redirect(wc_get_checkout_url());
-                    exit;
-                }
+            if ($order && $order->get_payment_method() === $this->id) {
+                $email = $order->get_billing_email();
+                $text = sprintf(
+                    __('Thank you for your order! We are processing your payment and will send a confirmation email to %s shortly. You can check the status of your order using the button below.', 'woo-multi-payment-gateway'),
+                    '<strong>' . esc_html($email) . '</strong>'
+                );
             }
+            return $text;
         }
 
-        public function isValidHash($data, $appSecret)
+        /**
+         * Add a refresh/status check button to the thank you page.
+         */
+        public function add_status_check_to_thankyou($order_id)
         {
-            $hashData = array(
-                'status' => $data['status'],
-                'transactionid' => $data['transactionid'],
-                'custominvoiceid' => $data['custominvoiceid'],
-            );
-
-            ksort($hashData);
-
-            $hashString = implode('', $hashData);
-
-            $computedHash = hash_hmac('sha256', $hashString, $appSecret);
-
-            return hash_equals($computedHash, $data['hash']);
+            $order = wc_get_order($order_id);
+            if ($order) {
+                $view_order_url = $order->get_view_order_url();
+                echo '<div style="margin: 2em 0;">';
+                echo '<p>' . __('Your payment is being confirmed by the gateway. This can take a few moments. Use the button below to see the latest status. If you purchased a digital product, the download link will appear on the order details page once payment is complete.', 'woo-multi-payment-gateway') . '</p>';
+                echo '<a href="' . esc_url($view_order_url) . '" class="button">' . __('View Order Details & Check Status', 'woo-multi-payment-gateway') . '</a>';
+                echo '</div>';
+            }
         }
     }
 
