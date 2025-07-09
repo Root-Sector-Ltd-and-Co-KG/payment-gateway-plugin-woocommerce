@@ -1,4 +1,13 @@
+---
 name: phpreleaser
+
+# 1) Explicitly give the GITHUB_TOKEN the right permissions
+permissions:
+  contents: read # read repo contents
+  issues: write # if you ever want to comment on issues/PRs
+  pull-requests: write # ditto
+  releases: write # <— this is the key one
+  packages: write # if you ever use packages
 
 on:
   pull_request:
@@ -12,11 +21,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # fetch all commits & tags so tag refs are available
+
       - name: Print Release Version
-        run: echo Release version is ${{ github.ref_name }}
+        run: echo "Release version is ${{ github.ref_name }}"
 
       - name: Create Subfolder
-        run: mkdir -p woocommerce-multi-payment-gateway && find . -maxdepth 1 -type f -exec mv {} woocommerce-multi-payment-gateway/ \; && find . -maxdepth 1 -type d ! -name woocommerce-multi-payment-gateway ! -name . -exec mv {} woocommerce-multi-payment-gateway/ \; && rm -rf woocommerce-multi-payment-gateway/.git* woocommerce-multi-payment-gateway/.github
+        run: |
+          mkdir -p woocommerce-multi-payment-gateway
+          find . -maxdepth 1 -type f \
+            -exec mv {} woocommerce-multi-payment-gateway/ \;
+          find . -maxdepth 1 -type d ! -name woocommerce-multi-payment-gateway ! -name . \
+            -exec mv {} woocommerce-multi-payment-gateway/ \;
+          rm -rf woocommerce-multi-payment-gateway/.git* woocommerce-multi-payment-gateway/.github
 
       - name: Archive Release
         uses: thedoctor0/zip-release@0.7.6
