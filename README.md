@@ -66,7 +66,7 @@ Your WooCommerce store is now ready to process payments through the Multi Paymen
 
 = 1.0.2 =
 
-- Fix: Correctly determine if a product is 'physical' or 'virtual' to prevent item type validation errors.
+- Fix: Correctly determine if a product is physical or virtual to prevent item type validation errors.
 - Enhancement: Improved descriptions for plugin settings for better clarity.
 - Enhancement: Updated README with detailed installation and configuration instructions.
 
