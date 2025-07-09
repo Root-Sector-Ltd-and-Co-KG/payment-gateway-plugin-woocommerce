@@ -1,13 +1,12 @@
 ---
 name: phpreleaser
 
-# 1) Explicitly give the GITHUB_TOKEN the right permissions
+# Grant GITHUB_TOKEN the rights it needs
 permissions:
-  contents: read # read repo contents
-  issues: write # if you ever want to comment on issues/PRs
-  pull-requests: write # ditto
-  releases: write # <— this is the key one
-  packages: write # if you ever use packages
+  contents: write        # gives access to create Releases via the REST API
+  issues: write          # optional, if you want to comment on PRs/issues
+  pull-requests: write   # optional, same
+  packages: write        # optional, if you publish packages
 
 on:
   pull_request:
@@ -22,7 +21,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # fetch all commits & tags so tag refs are available
+          fetch-depth: 0
 
       - name: Print Release Version
         run: echo "Release version is ${{ github.ref_name }}"
