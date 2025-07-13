@@ -28,22 +28,22 @@ jobs:
 
       - name: Create Subfolder
         run: |
-          mkdir -p woocommerce-multi-payment-gateway
+          mkdir -p woocommerce-payment-gateway-app
           find . -maxdepth 1 -type f \
-            -exec mv {} woocommerce-multi-payment-gateway/ \;
-          find . -maxdepth 1 -type d ! -name woocommerce-multi-payment-gateway ! -name . \
-            -exec mv {} woocommerce-multi-payment-gateway/ \;
-          rm -rf woocommerce-multi-payment-gateway/.git* woocommerce-multi-payment-gateway/.github
+            -exec mv {} woocommerce-payment-gateway-app/ \;
+          find . -maxdepth 1 -type d ! -name woocommerce-payment-gateway-app ! -name . \
+            -exec mv {} woocommerce-payment-gateway-app/ \;
+          rm -rf woocommerce-payment-gateway-app/.git* woocommerce-payment-gateway-app/.github
 
       - name: Archive Release
         uses: thedoctor0/zip-release@0.7.6
         with:
           type: "zip"
-          filename: woocommerce-multi-payment-gateway_v${{ github.ref_name }}.zip
-          exclusions: "woocommerce-multi-payment-gateway/RELEASE.md *.git* *.github*"
+          filename: woocommerce-payment-gateway-app_v${{ github.ref_name }}.zip
+          exclusions: "woocommerce-payment-gateway-app/RELEASE.md *.git* *.github*"
 
       - name: Upload Release
         uses: ncipollo/release-action@v1
         with:
-          artifacts: woocommerce-multi-payment-gateway_v${{ github.ref_name }}.zip
+          artifacts: woocommerce-payment-gateway-app_v${{ github.ref_name }}.zip
           token: ${{ secrets.GITHUB_TOKEN }}
