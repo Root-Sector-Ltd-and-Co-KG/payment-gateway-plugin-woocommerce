@@ -3,7 +3,7 @@
  * Plugin Name: WooCommerce Payment Gateway App
  * Plugin URI: https://payment-gateway.app
  * Description: Unified payment-gateway extension for WooCommerce — connect multiple providers through your self-hosted Payment Gateway App.
- * Version: 1.0.3
+ * Version: dev
  * Requires at least: 6.4
  * Requires PHP: 8.1
  * Author: Root Sector Ltd. & Co. KG

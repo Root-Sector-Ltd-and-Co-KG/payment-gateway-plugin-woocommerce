@@ -23,6 +23,10 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Update Version in PHP file
+        run: |
+          sed -i "s/^\\( \\* Version: \\).*/\\1${{ github.ref_name }}/" woocommerce-payment-gateway-app.php
+
       - name: Print Release Version
         run: echo "Release version is ${{ github.ref_name }}"
 
