@@ -4,7 +4,7 @@ Tags: payment gateway, woocommerce, credit card, direct debit, unified checkout
 Requires at least: 6.1
 Tested up to: 6.7.1
 Requires PHP: 8.1
-Stable tag: 1.0.3
+Stable tag: 1.0.4
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0
 
@@ -20,7 +20,8 @@ only a single gateway at checkout. Orders stay in sync via secure webhooks.
 
 * One clean checkout button for multiple processors
 * Centralised management of providers inside Payment Gateway App
-* Secure HMAC-signed webhooks keep order statuses accurate
+* Secure HMAC-SHA256 signed webhooks keep order statuses accurate
+* API Key authentication for checkout session creation
 * Debug mode and detailed logs for developers
 * Built for growth – add new providers without touching WordPress
 
@@ -44,14 +45,40 @@ only a single gateway at checkout. Orders stay in sync via secure webhooks.
    * **Enable/Disable** – turn the gateway on/off
    * **Title / Description** – what customers see at checkout
    * **API Domain** – domain of your backend (e.g. `api.payment-gateway.app`)
-   * **Site ID** – from Payment Gateway App admin
-   * **Site Secret Key** – secret key from the same page
+   * **Site ID** – from Payment Gateway App admin → Sites → Edit
+   * **API Key** – create one under Payment Gateway App admin → API Keys with `checkout:write` scope
+   * **Webhook Signing Secret** – the `whsec_`-prefixed secret from Payment Gateway App admin → Sites → Edit → Webhook Signing Secret
    * **Debug Log** – enable for verbose Woo logs (`WooCommerce → Status → Logs`)
    * **Pass Billing / Shipping Address, Pass Items** – optional extra data
 
 4. Click **Save changes**. You are ready to accept payments!
 
+== Webhook (IPN) ==
+
+The plugin registers a webhook endpoint automatically at:
+
+`[YOUR-SITE]/wc-api/wc_payment_gateway_app`
+
+When a transaction status changes, Payment Gateway App sends a POST
+request to this URL. Each request includes two signature headers:
+
+* `X-Signature-Timestamp` – Unix timestamp (seconds) of when the request was signed
+* `X-Signature-HMAC-SHA256` – HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret
+
+The plugin verifies both headers before processing. If verification
+fails the request is rejected and logged (when Debug Log is enabled).
+
+If you suspect your Webhook Signing Secret has been compromised,
+regenerate it in Payment Gateway App admin → Sites → Edit and update
+the value in the WooCommerce plugin settings.
+
 == Changelog ==
+
+= 1.0.4 =
+- Security: Replaced Site Secret Key with dedicated Webhook Signing Secret (`whsec_` prefix) for IPN verification.
+- Security: Added separate API Key field for checkout session authentication.
+- Enhancement: Improved webhook verification with HMAC-SHA256 + timestamp replay protection.
+- Docs: Updated README with Webhook/IPN section and new configuration fields.
 
 = 1.0.3 =
 - Docs: Updated README.

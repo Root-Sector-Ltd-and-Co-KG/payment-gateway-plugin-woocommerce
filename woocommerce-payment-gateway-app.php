@@ -26,7 +26,8 @@ function init_woocommerce_payment_gateway_app()
     class WooCommerce_Payment_Gateway_App extends WC_Payment_Gateway
     {
 		// Properties
-        protected $site_secret_key;
+        protected $api_key;
+        protected $webhook_secret;
         protected $api_domain;
         protected $currency;
         protected $debug;
@@ -45,7 +46,8 @@ function init_woocommerce_payment_gateway_app()
 
             $this->title = $this->get_option('title');
             $this->description = $this->get_option('description');
-            $this->site_secret_key = $this->get_option('site_secret_key');
+            $this->api_key = $this->get_option('api_key');
+            $this->webhook_secret = $this->get_option('webhook_secret');
             $this->site_id = $this->get_option('site_id');
             $this->api_domain = rtrim($this->get_option('api_domain'), '/') . '/';
             $this->currency = get_woocommerce_currency();
@@ -102,10 +104,16 @@ function init_woocommerce_payment_gateway_app()
                     'description' => __('Copy the Site ID from Payment Gateway App Dashboard > Sites.', 'woo-payment-gateway-app'),
                     'default' => ''
                 ),
-                'site_secret_key' => array(
-                    'title' => __('Site Secret Key', 'woo-payment-gateway-app'),
+                'api_key' => array(
+                    'title' => __('API Key', 'woo-payment-gateway-app'),
                     'type' => 'password',
-                    'description' => __('Copy the site secret key from Payment Gateway App Dashboard > Sites.', 'woo-payment-gateway-app'),
+                    'description' => __('Create an API Key with checkout:create scope from Payment Gateway App Dashboard > API Keys.', 'woo-payment-gateway-app'),
+                    'default' => ''
+                ),
+                'webhook_secret' => array(
+                    'title' => __('Webhook Signing Secret', 'woo-payment-gateway-app'),
+                    'type' => 'password',
+                    'description' => __('Copy the Webhook Signing Secret from Payment Gateway App Dashboard > Sites > Edit Site. This secret verifies that IPN/webhook notifications are genuinely from your payment gateway and have not been tampered with (HMAC-SHA256). Starts with whsec_.', 'woo-payment-gateway-app'),
                     'default' => ''
                 ),
                 'debug' => array(
@@ -135,6 +143,16 @@ function init_woocommerce_payment_gateway_app()
                     'description' => __('Send invoice line-items to the payment gateway app.', 'woo-payment-gateway-app'),
                     'default' => 'yes'
                 ),
+                'tax_handling' => array(
+                    'title' => __('Item Tax Handling', 'woo-payment-gateway-app'),
+                    'type' => 'select',
+                    'description' => __('Controls how tax is included in line-item prices sent to the payment gateway.<br><strong>Included (recommended):</strong> Tax is included in each item\'s unit price. No separate tax line. Best when Payment Gateway App calculates tax.<br><strong>Separate line item:</strong> Items are sent at net prices with a separate "Tax" line item. Use only when Payment Gateway App does NOT calculate tax.', 'woo-payment-gateway-app'),
+                    'default' => 'included',
+                    'options' => array(
+                        'included' => __('Tax included in item prices (recommended)', 'woo-payment-gateway-app'),
+                        'separate' => __('Tax as separate line item', 'woo-payment-gateway-app'),
+                    ),
+                ),
             );
         }
 
@@ -146,17 +164,15 @@ function init_woocommerce_payment_gateway_app()
                 return;
             }
 
-            // Sanitize and validate inputs
-            $amount = round($order->get_total() * 100); // Total amount including items, shipping, and tax
+            // Sanitize and validate inputs (use esc_url_raw for API payloads, not esc_url which is for HTML output)
             $email = sanitize_email($order->get_billing_email());
-            $cancelurl = esc_url($order->get_cancel_order_url());
-            $returnurl = esc_url($this->get_return_url($order));
-            $ipnurl = esc_url(add_query_arg('wc-api', 'wc_payment_gateway_app', home_url('/', 'https')));
+            $cancelurl = esc_url_raw($order->get_cancel_order_url());
+            $returnurl = esc_url_raw($this->get_return_url($order));
+            $ipnurl = esc_url_raw(add_query_arg('wc-api', 'wc_payment_gateway_app', home_url('/', 'https')));
 
             if ($this->debug) {
                 $this->log->debug('Creating Payment Session', array(
                     'source' => 'woocommerce-payment-gateway-app',
-                    'amount' => $amount,
                     'email' => $email,
                     'order_id' => $order_id,
                     'return_url' => $returnurl,
@@ -165,7 +181,7 @@ function init_woocommerce_payment_gateway_app()
                 ));
             }
 
-            $payment_session_url = 'https://' . $this->api_domain . 'api/v1/sessions/create';
+            $payment_session_url = 'https://' . $this->api_domain . 'v1/checkouts/' . $this->site_id . '/create';
 
             if ($this->debug) {
                 $this->log->debug('Preparing hashData', array('source' => 'woocommerce-payment-gateway-app', 'order_id' => $order_id));
@@ -175,7 +191,7 @@ function init_woocommerce_payment_gateway_app()
                 'amount' => round($order->get_total() * 100), // Amount in cents
                 'currency' => get_woocommerce_currency(),
                 'email' => $email,
-                'customInvoiceId' => (string) $order_id,
+                'externalReference' => (string) $order_id,
                 'returnUrl' => $returnurl,
                 'cancelUrl' => $cancelurl,
                 'ipnUrl' => $ipnurl,
@@ -208,65 +224,125 @@ function init_woocommerce_payment_gateway_app()
         
             if ('yes' === $this->get_option('pass_items')) {
                 $items = array();
+                $tax_handling = $this->get_option('tax_handling', 'included');
 
-                // Product items
-                foreach ($order->get_items() as $item) {
-                    $product = $item->get_product();
-                    $item_type = ($product && $product->is_virtual()) ? 'virtual' : 'physical';
-                    $items[] = array(
-                        'name'     => $item->get_name(),
-                        'quantity' => $item->get_quantity(),
-                        'amount'   => round(($item->get_subtotal() / $item->get_quantity()) * 100),
-                        'type'     => $item_type
-                    );
+                if ($tax_handling === 'included') {
+                    // Tax-included mode: each item's unitPrice contains its share of tax.
+                    // No separate tax line item. This is the recommended mode when Payment
+                    // Gateway App has its own tax calculation enabled (it extracts tax from gross).
+
+                    // Product items (gross = net + tax, after coupons)
+                    foreach ($order->get_items() as $item) {
+                        $product = $item->get_product();
+                        $item_type = ($product && $product->is_virtual()) ? 'virtual' : 'physical';
+                        $quantity = max(1, (int)$item->get_quantity());
+                        $line_gross = $item->get_total() + $item->get_total_tax();
+                        $items[] = array(
+                            'description' => $item->get_name(),
+                            'quantity'    => $quantity,
+                            'unitPrice'   => round(($line_gross / $quantity) * 100),
+                            'itemType'    => $item_type
+                        );
+                    }
+
+                    // Shipping item (gross)
+                    $shipping_gross = $order->get_shipping_total() + $order->get_shipping_tax();
+                    if ($shipping_gross > 0) {
+                        $items[] = array(
+                            'description' => 'Shipping',
+                            'quantity'    => 1,
+                            'unitPrice'   => round($shipping_gross * 100),
+                            'itemType'    => 'shipping'
+                        );
+                    }
+
+                    // Fee items (gross) — e.g. surcharges added by other plugins
+                    foreach ($order->get_fees() as $fee) {
+                        $fee_gross = $fee->get_total() + $fee->get_total_tax();
+                        if ($fee_gross != 0) {
+                            $items[] = array(
+                                'description' => $fee->get_name(),
+                                'quantity'    => 1,
+                                'unitPrice'   => round($fee_gross * 100),
+                                'itemType'    => $fee_gross < 0 ? 'discount' : 'virtual'
+                            );
+                        }
+                    }
+                } else {
+                    // Separate-tax mode: items are sent at net prices (after coupons, before tax)
+                    // with a single "Tax" line item. Use this when Payment Gateway App does NOT
+                    // calculate tax and you want to pass WooCommerce's tax calculation through.
+
+                    // Product items (net, after coupons)
+                    foreach ($order->get_items() as $item) {
+                        $product = $item->get_product();
+                        $item_type = ($product && $product->is_virtual()) ? 'virtual' : 'physical';
+                        $quantity = max(1, (int)$item->get_quantity());
+                        $items[] = array(
+                            'description' => $item->get_name(),
+                            'quantity'    => $quantity,
+                            'unitPrice'   => round(($item->get_total() / $quantity) * 100),
+                            'itemType'    => $item_type
+                        );
+                    }
+
+                    // Shipping item (net)
+                    if ($order->get_shipping_total() > 0) {
+                        $items[] = array(
+                            'description' => 'Shipping',
+                            'quantity'    => 1,
+                            'unitPrice'   => round($order->get_shipping_total() * 100),
+                            'itemType'    => 'shipping'
+                        );
+                    }
+
+                    // Fee items (net)
+                    foreach ($order->get_fees() as $fee) {
+                        if ($fee->get_total() != 0) {
+                            $items[] = array(
+                                'description' => $fee->get_name(),
+                                'quantity'    => 1,
+                                'unitPrice'   => round($fee->get_total() * 100),
+                                'itemType'    => $fee->get_total() < 0 ? 'discount' : 'virtual'
+                            );
+                        }
+                    }
+
+                    // Tax line item
+                    if ($order->get_total_tax() > 0) {
+                        $items[] = array(
+                            'description' => 'Tax',
+                            'quantity'    => 1,
+                            'unitPrice'   => round($order->get_total_tax() * 100),
+                            'itemType'    => 'tax'
+                        );
+                    }
                 }
-    
-                // Shipping item
-                if ($order->get_shipping_total() > 0) {
-                    $items[] = array(
-                        'name'     => 'Shipping',
-                        'quantity' => 1,
-                        'amount'   => round($order->get_shipping_total() * 100),
-                        'type'     => 'shipping'
-                    );
-                }
-    
-                // Tax item
-                if ($order->get_total_tax() > 0) {
-                    $items[] = array(
-                        'name'     => 'Tax',
-                        'quantity' => 1,
-                        'amount'   => round($order->get_total_tax() * 100),
-                        'type'     => 'tax'
-                    );
-                }
-    
+
                 // Correct for rounding errors by ensuring the sum of items exactly equals the order total.
                 $items_total_cents = 0;
-                foreach ($items as $item) {
-                    $items_total_cents += $item['amount'] * $item['quantity'];
+                foreach ($items as $it) {
+                    $items_total_cents += $it['unitPrice'] * $it['quantity'];
                 }
-    
+
                 $total_cents = round($order->get_total() * 100);
                 $diff_cents = $total_cents - $items_total_cents;
-    
-                if ($diff_cents != 0) {
-                    // Find the tax item and adjust it. If no tax item, adjust the last item.
+
+                if ($diff_cents != 0 && count($items) > 0) {
+                    // Adjust the last product/shipping item (avoid adjusting discount items).
                     $adjusted = false;
-                    for ($i = 0; $i < count($items); $i++) {
-                        if ($items[$i]['type'] === 'tax') {
-                            $items[$i]['amount'] += $diff_cents;
+                    for ($i = count($items) - 1; $i >= 0; $i--) {
+                        if (in_array($items[$i]['itemType'], array('physical', 'virtual', 'shipping', 'tax'), true)) {
+                            $items[$i]['unitPrice'] += $diff_cents;
                             $adjusted = true;
                             break;
                         }
                     }
-    
-                    // If no tax item was found, adjust the last item in the array.
-                    if (!$adjusted && count($items) > 0) {
-                        $items[count($items) - 1]['amount'] += $diff_cents;
+                    if (!$adjusted) {
+                        $items[count($items) - 1]['unitPrice'] += $diff_cents;
                     }
                 }
-    
+
                 $hashData['items'] = $items;
             }
             
@@ -281,10 +357,10 @@ function init_woocommerce_payment_gateway_app()
             $response = wp_remote_post(
                 $payment_session_url,
                 array(
+                    'timeout' => 30,
                     'headers' => array(
                         'Content-Type' => 'application/json',
-                        'Site-Id' => $this->site_id,
-                        'Site-Secret-Key' => $this->site_secret_key,
+                        'Authorization' => 'Bearer ' . $this->api_key,
                     ),
                     'body' => json_encode($hashData),
                 )
@@ -324,8 +400,8 @@ function init_woocommerce_payment_gateway_app()
                 }
 
                 // Append the request ID for debugging purposes if it exists.
-                if (isset($response_body['request_id'])) {
-                    $error_message .= ' (Request-ID: ' . esc_html($response_body['request_id']) . ')';
+                if (isset($response_body['requestId'])) {
+                    $error_message .= ' (Request-ID: ' . esc_html($response_body['requestId']) . ')';
                 }
 
                 wc_add_notice(__('Payment session creation failed. Error: ', 'woo-payment-gateway-app') . $error_message, 'error');
@@ -368,7 +444,8 @@ function init_woocommerce_payment_gateway_app()
             }
 
             $error_message = $response_body['error'] ?? __('an unexpected error occurred', 'woo-payment-gateway-app');
-            wc_add_notice(__('Payment session creation failed. Reason: ', 'woo-payment-gateway-app') . $error_message, 'error');            return array(
+            wc_add_notice(__('Payment session creation failed. Reason: ', 'woo-payment-gateway-app') . $error_message, 'error');
+            return array(
                 'result' => 'failure',
                 'redirect' => $cancelurl
             );
@@ -382,22 +459,18 @@ function init_woocommerce_payment_gateway_app()
 
         public function webhook_response()
         {
+            $raw_body = file_get_contents('php://input');
+
             if ($this->debug) {
                 $this->log->debug('Incoming webhook request', array(
                     'source' => 'woocommerce-payment-gateway-app',
-                    'headers' => getallheaders(),
-                    'raw_body' => file_get_contents('php://input'),
-                    'method' => $_SERVER['REQUEST_METHOD'],
-                    'query_params' => $_GET
+                    'method' => $_SERVER['REQUEST_METHOD'] ?? 'unknown',
                 ));
             }
 
-            $appSecret = $this->site_secret_key;
-
-            // --- New Webhook Verification Logic ---
+            // --- Webhook Signature Verification (HMAC-SHA256 signed with API Key) ---
             $received_timestamp = $_SERVER['HTTP_X_SIGNATURE_TIMESTAMP'] ?? null;
             $received_signature = $_SERVER['HTTP_X_SIGNATURE_HMAC_SHA256'] ?? null;
-            $raw_body = file_get_contents('php://input');
 
             if (!$received_timestamp || !$received_signature) {
                 if ($this->debug) {
@@ -407,8 +480,19 @@ function init_woocommerce_payment_gateway_app()
                 exit("Signature headers missing");
             }
 
-            // Check if timestamp is recent (e.g., within 5 minutes) to prevent replay attacks.
-            if (time() - (int)$received_timestamp > 300) {
+            // Check if timestamp is recent (within 5 minutes) to prevent replay attacks.
+            if (!is_numeric($received_timestamp)) {
+                if ($this->debug) {
+                    $this->log->error('Invalid webhook timestamp', array(
+                        'source' => 'woocommerce-payment-gateway-app',
+                        'received_timestamp' => $received_timestamp
+                    ));
+                }
+                status_header(400);
+                exit("Invalid signature timestamp");
+            }
+
+            if (abs(time() - (int)$received_timestamp) > 300) {
                 if ($this->debug) {
                     $this->log->error('Webhook timestamp is too old', array(
                         'source' => 'woocommerce-payment-gateway-app',
@@ -419,24 +503,19 @@ function init_woocommerce_payment_gateway_app()
                 exit("Webhook timestamp too old");
             }
 
-            // Recreate the signature string.
+            // Recreate the signature string and verify using the webhook signing secret.
             $string_to_sign = $received_timestamp . '.' . $raw_body;
-            $computed_hash = hash_hmac('sha256', $string_to_sign, $appSecret);
+            $computed_hash = hash_hmac('sha256', $string_to_sign, $this->webhook_secret);
 
-            // Securely compare the signatures.
+            // Securely compare the signatures (timing-safe).
             if (!hash_equals($computed_hash, $received_signature)) {
                 if ($this->debug) {
-                    $this->log->error('Invalid webhook signature', array(
-                        'source' => 'woocommerce-payment-gateway-app',
-                        'string_to_hash' => $string_to_sign,
-                        'computed_hash' => $computed_hash,
-                        'received_signature' => $received_signature
-                    ));
+                    $this->log->error('Invalid webhook signature', array('source' => 'woocommerce-payment-gateway-app'));
                 }
                 status_header(400);
                 exit("Invalid signature");
             }
-            // --- End New Verification Logic ---
+            // --- End Webhook Signature Verification ---
 
             $parsed_request = json_decode($raw_body, true);
             if (json_last_error() !== JSON_ERROR_NONE || !is_array($parsed_request)) {
@@ -451,33 +530,49 @@ function init_woocommerce_payment_gateway_app()
                 exit("Invalid JSON");
             }
 
-            $order = wc_get_order($parsed_request['customInvoiceId']);
+            if (!isset($parsed_request['externalReference'], $parsed_request['status'], $parsed_request['id']) || !is_numeric($parsed_request['status'])) {
+                if ($this->debug) {
+                    $this->log->error('Missing or invalid webhook fields', array(
+                        'source' => 'woocommerce-payment-gateway-app',
+                        'parsed_request' => $parsed_request
+                    ));
+                }
+                status_header(400);
+                exit("Missing required fields");
+            }
+
+            $order = wc_get_order($parsed_request['externalReference']);
             if (!$order) {
                 status_header(404);
                 exit("Order not found");
             }
 
-            switch ($parsed_request['status']) {
-                case 0:
-                    $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-payment-gateway-app'), $parsed_request['id']));
+            $transaction_id = sanitize_text_field($parsed_request['id']);
+
+            switch ((int) $parsed_request['status']) {
+                case 0: // Pending
+                    $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
-                case 1:
-                    $order->update_status('completed', sprintf(__('Payment completed. Transaction ID: %s', 'woo-payment-gateway-app'), $parsed_request['id']));
+                case 1: // Completed
+                    if (!$order->is_paid()) {
+                        $order->payment_complete($transaction_id);
+                        $order->add_order_note(sprintf(__('Payment completed. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
+                    }
                     break;
-                case 2:
-                    $order->update_status('failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-payment-gateway-app'), $parsed_request['id']));
+                case 2: // Failed
+                    $order->update_status('failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
-                case 3:
-                    $order->update_status('refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-payment-gateway-app'), $parsed_request['id']));
+                case 3: // Refunded
+                    $order->update_status('refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
-                case 4:
-                    $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-payment-gateway-app'), $parsed_request['id']));
+                case 4: // Chargeback/Disputed
+                    $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
-                case -1:
-                    $order->update_status('on-hold', sprintf(__('Payment initiated. Transaction ID: %s', 'woo-payment-gateway-app'), $parsed_request['id']));
+                case -1: // Initiated
+                    $order->update_status('on-hold', sprintf(__('Payment initiated. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
-                case -2:
-                    $order->update_status('cancelled', sprintf(__('Payment cancelled. Transaction ID: %s', 'woo-payment-gateway-app'), $parsed_request['id']));
+                case -2: // Cancelled
+                    $order->update_status('cancelled', sprintf(__('Payment cancelled. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
             }
 
@@ -519,7 +614,7 @@ function init_woocommerce_payment_gateway_app()
 	// Register gateway with WooCommerce
     function add_payment_gateway_app($methods)
     {
-        $methods[] = 'WooCommerce_payment_gateway_app';
+        $methods[] = 'WooCommerce_Payment_Gateway_App';
         return $methods;
     }
 
