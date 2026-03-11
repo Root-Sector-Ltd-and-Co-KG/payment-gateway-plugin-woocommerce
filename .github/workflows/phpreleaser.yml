@@ -3,10 +3,10 @@ name: phpreleaser
 
 # Grant GITHUB_TOKEN the rights it needs
 permissions:
-  contents: write        # gives access to create Releases via the REST API
-  issues: write          # optional, if you want to comment on PRs/issues
-  pull-requests: write   # optional, same
-  packages: write        # optional, if you publish packages
+  contents: write # gives access to create Releases via the REST API
+  issues: write # optional, if you want to comment on PRs/issues
+  pull-requests: write # optional, same
+  packages: write # optional, if you publish packages
 
 on:
   pull_request:
@@ -19,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
