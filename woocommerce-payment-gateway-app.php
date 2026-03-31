@@ -90,7 +90,7 @@ function init_woocommerce_payment_gateway_app()
                     'title' => __('Description', 'woo-payment-gateway-app'),
                     'type' => 'textarea',
                     'description' => __('This controls the description which the user sees during checkout.', 'woo-payment-gateway-app'),
-                    'default' => __('Pay securely with credit/debit cards, crypto, bank transfer, or local options.', 'woo-payment-gateway-app')
+                    'default' => __('Pay securely with credit/debit cards, crypto, wire transfer, or local options.', 'woo-payment-gateway-app')
                 ),
                 'api_domain' => array(
                     'title' => __('API Domain', 'woo-payment-gateway-app'),
