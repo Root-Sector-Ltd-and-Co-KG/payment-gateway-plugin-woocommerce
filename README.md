@@ -2,7 +2,7 @@
 Contributors: r00tsector
 Tags: payment gateway, woocommerce, credit card, direct debit, unified checkout
 Requires at least: 6.1
-Tested up to: 6.7.1
+Tested up to: 6.9.4
 Requires PHP: 8.1
 Stable tag: 1.0.4
 License: GPLv3
@@ -18,17 +18,17 @@ only a single gateway at checkout. Orders stay in sync via secure webhooks.
 
 **Key Features**
 
-* One clean checkout button for multiple processors
-* Centralised management of providers inside Payment Gateway App
-* Secure HMAC-SHA256 signed webhooks keep order statuses accurate
-* API Key authentication for checkout session creation
-* Debug mode and detailed logs for developers
-* Built for growth – add new providers without touching WordPress
+- One clean checkout button for multiple processors
+- Centralised management of providers inside Payment Gateway App
+- Secure HMAC-SHA256 signed webhooks keep order statuses accurate
+- API Key authentication for checkout session creation
+- Debug mode and detailed logs for developers
+- Built for growth – add new providers without touching WordPress
 
 == Requirements ==
 
-* A running instance of Payment Gateway App
-* WordPress with WooCommerce activated
+- A running instance of Payment Gateway App
+- WordPress with WooCommerce activated
 
 == Installation ==
 
@@ -41,15 +41,14 @@ only a single gateway at checkout. Orders stay in sync via secure webhooks.
 1. Go to **WooCommerce → Settings → Payments**.
 2. Click **Manage** next to **Payment Gateway App**.
 3. Fill in the fields:
-
-   * **Enable/Disable** – turn the gateway on/off
-   * **Title / Description** – what customers see at checkout
-   * **API Domain** – domain of your backend (e.g. `api.payment-gateway.app`)
-   * **Site ID** – from Payment Gateway App admin → Sites → Edit
-   * **API Key** – create one under Payment Gateway App admin → API Keys with `checkout:write` scope
-   * **Webhook Signing Secret** – the `whsec_`-prefixed secret from Payment Gateway App admin → Sites → Edit → Webhook Signing Secret
-   * **Debug Log** – enable for verbose Woo logs (`WooCommerce → Status → Logs`)
-   * **Pass Billing / Shipping Address, Pass Items** – optional extra data
+   - **Enable/Disable** – turn the gateway on/off
+   - **Title / Description** – what customers see at checkout
+   - **API Domain** – domain of your backend (e.g. `api.payment-gateway.app`)
+   - **Site ID** – from Payment Gateway App admin → Sites → Edit
+   - **API Key** – create one under Payment Gateway App admin → API Keys with `checkout:write` scope
+   - **Webhook Signing Secret** – the `whsec_`-prefixed secret from Payment Gateway App admin → Sites → Edit → Webhook Signing Secret
+   - **Debug Log** – enable only while troubleshooting (see **Debug log security** below)
+   - **Pass Billing / Shipping Address, Pass Items** – optional extra data
 
 4. Click **Save changes**. You are ready to accept payments!
 
@@ -62,8 +61,8 @@ The plugin registers a webhook endpoint automatically at:
 When a transaction status changes, Payment Gateway App sends a POST
 request to this URL. Each request includes two signature headers:
 
-* `X-Signature-Timestamp` – Unix timestamp (seconds) of when the request was signed
-* `X-Signature-HMAC-SHA256` – HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret
+- `X-Signature-Timestamp` – Unix timestamp (seconds) of when the request was signed
+- `X-Signature-HMAC-SHA256` – HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret
 
 The plugin verifies both headers before processing. If verification
 fails the request is rejected and logged (when Debug Log is enabled).
@@ -72,15 +71,27 @@ If you suspect your Webhook Signing Secret has been compromised,
 regenerate it in Payment Gateway App admin → Sites → Edit and update
 the value in the WooCommerce plugin settings.
 
+== Debug log security ==
+
+When **Debug Log** is enabled, failed checkout requests and webhook
+verification issues may be written to WooCommerce logs
+(**WooCommerce → Status → Logs**, source `woocommerce-payment-gateway-app`).
+Those entries can include API error payloads, order metadata, and request
+correlation IDs. Keep debug mode **disabled on production stores** unless
+you are actively diagnosing an issue, and restrict log access to trusted
+administrators.
+
 == Changelog ==
 
 = 1.0.4 =
+
 - Security: Replaced Site Secret Key with dedicated Webhook Signing Secret (`whsec_` prefix) for IPN verification.
 - Security: Added separate API Key field for checkout session authentication.
 - Enhancement: Improved webhook verification with HMAC-SHA256 + timestamp replay protection.
 - Docs: Updated README with Webhook/IPN section and new configuration fields.
 
 = 1.0.3 =
+
 - Docs: Updated README.
 
 = 1.0.2 =

@@ -70,6 +70,25 @@ function init_woocommerce_payment_gateway_app()
             add_action('woocommerce_thankyou_' . $this->id, array($this, 'add_status_check_to_thankyou'), 20);
         }
 
+        /**
+         * Prefer API `message`, then legacy `error` field.
+         *
+         * @param array<string, mixed>|null $response_body
+         */
+        private function get_api_error_message($response_body, $fallback)
+        {
+            if (!is_array($response_body)) {
+                return $fallback;
+            }
+            if (!empty($response_body['message']) && is_string($response_body['message'])) {
+                return $response_body['message'];
+            }
+            if (!empty($response_body['error']) && is_string($response_body['error'])) {
+                return $response_body['error'];
+            }
+            return $fallback;
+        }
+
 		// Admin Form
         public function init_form_fields()
         {
@@ -392,7 +411,10 @@ function init_woocommerce_payment_gateway_app()
             $response_body = json_decode(wp_remote_retrieve_body($response), true);
 
             if ($response_code !== 200) {
-                $error_message = $response_body['error'] ?? __('Payment session creation failed due to an unexpected error.', 'woo-payment-gateway-app');
+                $error_message = $this->get_api_error_message(
+                    $response_body,
+                    __('Payment session creation failed due to an unexpected error.', 'woo-payment-gateway-app')
+                );
 
                 // Check for the specific rounding error and provide a more user-friendly message.
                 if (strpos($error_message, 'sum of item amounts') !== false && strpos($error_message, 'does not match total amount') !== false) {
