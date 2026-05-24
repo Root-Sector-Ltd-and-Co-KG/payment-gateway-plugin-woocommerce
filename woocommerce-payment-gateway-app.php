@@ -253,7 +253,7 @@ function init_woocommerce_payment_gateway_app()
                     // Product items (gross = net + tax, after coupons)
                     foreach ($order->get_items() as $item) {
                         $product = $item->get_product();
-                        $item_type = ($product && $product->is_virtual()) ? 'virtual' : 'physical';
+                        $item_type = ($product && $product->is_virtual()) ? 'digital_service' : 'goods';
                         $quantity = max(1, (int)$item->get_quantity());
                         $line_gross = $item->get_total() + $item->get_total_tax();
                         $items[] = array(
@@ -283,7 +283,7 @@ function init_woocommerce_payment_gateway_app()
                                 'description' => $fee->get_name(),
                                 'quantity'    => 1,
                                 'unitPrice'   => round($fee_gross * 100),
-                                'itemType'    => $fee_gross < 0 ? 'discount' : 'virtual'
+                                'itemType'    => $fee_gross < 0 ? 'discount' : 'digital_service'
                             );
                         }
                     }
@@ -295,7 +295,7 @@ function init_woocommerce_payment_gateway_app()
                     // Product items (net, after coupons)
                     foreach ($order->get_items() as $item) {
                         $product = $item->get_product();
-                        $item_type = ($product && $product->is_virtual()) ? 'virtual' : 'physical';
+                        $item_type = ($product && $product->is_virtual()) ? 'digital_service' : 'goods';
                         $quantity = max(1, (int)$item->get_quantity());
                         $items[] = array(
                             'description' => $item->get_name(),
@@ -322,7 +322,7 @@ function init_woocommerce_payment_gateway_app()
                                 'description' => $fee->get_name(),
                                 'quantity'    => 1,
                                 'unitPrice'   => round($fee->get_total() * 100),
-                                'itemType'    => $fee->get_total() < 0 ? 'discount' : 'virtual'
+                                'itemType'    => $fee->get_total() < 0 ? 'discount' : 'digital_service'
                             );
                         }
                     }
@@ -351,7 +351,7 @@ function init_woocommerce_payment_gateway_app()
                     // Adjust the last product/shipping item (avoid adjusting discount items).
                     $adjusted = false;
                     for ($i = count($items) - 1; $i >= 0; $i--) {
-                        if (in_array($items[$i]['itemType'], array('physical', 'virtual', 'shipping', 'tax'), true)) {
+                        if (in_array($items[$i]['itemType'], array('goods', 'digital_service', 'shipping', 'tax'), true)) {
                             $items[$i]['unitPrice'] += $diff_cents;
                             $adjusted = true;
                             break;
