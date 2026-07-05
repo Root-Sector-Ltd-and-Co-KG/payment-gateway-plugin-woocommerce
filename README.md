@@ -22,7 +22,7 @@ only a single gateway at checkout. Orders stay in sync via secure webhooks.
 - Centralised management of providers inside Payment Gateway App
 - Secure HMAC-SHA256 signed webhooks keep order statuses accurate
 - API Key authentication for checkout session creation
-- Debug mode and detailed logs for developers
+- Debug mode with request IDs and safe gateway metadata for support
 - Built for growth – add new providers without touching WordPress
 
 == Requirements ==
@@ -61,27 +61,60 @@ The plugin registers a webhook endpoint automatically at:
 When a transaction status changes, Payment Gateway App sends a POST
 request to this URL. Each request includes two signature headers:
 
-- `X-Signature-Timestamp` – Unix timestamp (seconds) of when the request was signed
-- `X-Signature-HMAC-SHA256` – HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret
+- `X-Signature-Timestamp` - Unix timestamp (seconds) of when the request was signed
+- `X-Signature-HMAC-SHA256` - HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret
 
 The plugin verifies both headers before processing. If verification
 fails the request is rejected and logged (when Debug Log is enabled).
 
 If you suspect your Webhook Signing Secret has been compromised,
-regenerate it in Payment Gateway App admin → Sites → Edit and update
+regenerate it in Payment Gateway App admin -> Sites -> Edit and update
 the value in the WooCommerce plugin settings.
+
+== Disputes and chargebacks ==
+
+Dispute webhooks may include `disputeStatus`, `chargebackStatus`, nested
+`chargeback.*` fields, or a top-level string `status` such as `open`,
+`under_review`, `won`, `lost`, or `accepted`. Numeric transaction statuses are
+still handled as normal payment status updates when no dispute status is
+present.
+
+For active or merchant-loss dispute statuses (`open`, `under_review`, `lost`,
+`accepted`), the plugin adds an order note with the gateway transaction ID,
+dispute ID, request ID, and credit-note number when available, then marks the
+WooCommerce order as `refunded`. Duplicate dispute webhook retries are tracked
+in order meta so the admin timeline is not spammed with repeated notes.
+
+`won` disputes are intentionally manual-only. The plugin records an order note
+with the available request/dispute metadata and returns `OK`, but it does not
+automatically complete, reopen, refund, or otherwise mutate the order. Process
+won chargebacks manually in WooCommerce after reviewing the gateway evidence.
+
+Checkout requests blocked by an unresolved dispute show a customer-safe error
+message and include the gateway request ID when the API provides one. Use that
+request ID to correlate the customer report with Payment Gateway App logs.
 
 == Debug log security ==
 
 When **Debug Log** is enabled, failed checkout requests and webhook
 verification issues may be written to WooCommerce logs
-(**WooCommerce → Status → Logs**, source `woocommerce-payment-gateway-app`).
-Those entries can include API error payloads, order metadata, and request
-correlation IDs. Keep debug mode **disabled on production stores** unless
-you are actively diagnosing an issue, and restrict log access to trusted
-administrators.
+(**WooCommerce -> Status -> Logs**, source `woocommerce-payment-gateway-app`).
+The plugin logs safe gateway metadata such as request ID, transaction ID,
+external reference, dispute status, gateway code, amount, and currency instead
+of full checkout request bodies, raw webhook payloads, or full gateway response
+bodies. Keep debug mode **disabled on production stores** unless you are
+actively diagnosing an issue, and restrict log access to trusted administrators.
 
 == Changelog ==
+
+= 1.0.7 =
+
+- Enhancement: Display checkout API request IDs in customer-facing failure messages when available.
+- Enhancement: Accept dispute-only webhooks with supported dispute status fields, including nested chargeback status and top-level string `status`.
+- Enhancement: Add traceable dispute order notes and idempotent duplicate-note handling for webhook retries.
+- Enhancement: Treat `won` disputes as manual-only trace events while marking non-won disputes as refunded.
+- Security: Sanitize debug logging to avoid full checkout request bodies, raw webhook payloads, and full gateway response bodies.
+- Docs: Document request ID, dispute, credit-note, and manual won-dispute behavior.
 
 = 1.0.4 =
 
