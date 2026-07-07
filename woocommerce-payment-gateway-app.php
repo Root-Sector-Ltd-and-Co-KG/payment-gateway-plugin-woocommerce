@@ -89,64 +89,92 @@ function init_woocommerce_payment_gateway_app()
             return $fallback;
         }
 
-        private function get_api_scalar($response_body, $keys)
+        private function get_api_request_id($response_body)
         {
             if (!is_array($response_body)) {
                 return '';
             }
-            foreach ($keys as $key) {
+            foreach (array('requestId', 'requestID') as $key) {
                 if (!empty($response_body[$key]) && is_scalar($response_body[$key])) {
                     return sanitize_text_field((string)$response_body[$key]);
+                }
+                if (!empty($response_body['chargeback']) && is_array($response_body['chargeback']) && !empty($response_body['chargeback'][$key]) && is_scalar($response_body['chargeback'][$key])) {
+                    return sanitize_text_field((string)$response_body['chargeback'][$key]);
                 }
             }
             return '';
         }
 
-        private function get_api_request_id($response_body)
+        private function get_parsed_scalar($data, $paths)
         {
-            return $this->get_api_scalar($response_body, array('requestId', 'requestID'));
+            foreach ($paths as $path) {
+                $value = $data;
+                foreach (explode('.', $path) as $segment) {
+                    if (!is_array($value) || !array_key_exists($segment, $value)) {
+                        $value = null;
+                        break;
+                    }
+                    $value = $value[$segment];
+                }
+                if (is_scalar($value)) {
+                    return sanitize_text_field((string)$value);
+                }
+            }
+            return '';
         }
 
-        private function format_customer_api_error($response_body, $fallback)
+        private function get_dispute_status($parsed_request)
         {
-            $message = trim($this->get_api_error_message($response_body, $fallback));
-            $code = $this->get_api_scalar($response_body, array('code'));
-
-            if ($code === 'CHECKOUT_BLOCKED_BY_DISPUTE') {
-                $message = __('Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.', 'woo-payment-gateway-app');
-            } elseif ($code === 'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD') {
-                $message = __('Payment cannot be started because this customer account is under merchant review. Please contact support.', 'woo-payment-gateway-app');
-            } elseif ($code === 'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD') {
-                $message = __('Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.', 'woo-payment-gateway-app');
+            foreach (array('disputeStatus', 'chargebackStatus', 'status', 'chargeback.status', 'chargeback.disputeStatus', 'chargeback.chargebackStatus') as $key) {
+                $status = strtolower($this->get_parsed_scalar($parsed_request, array($key)));
+                if ($this->is_supported_dispute_status($status)) {
+                    return $status;
+                }
             }
-
-            $request_id = $this->get_api_request_id($response_body);
-            if ($request_id !== '') {
-                $message .= ' (Request-ID: ' . esc_html($request_id) . ')';
-            }
-            return $message;
+            return '';
         }
 
-        private function get_safe_gateway_context($response_body, $extra = array())
+        private function is_supported_dispute_status($status)
+        {
+            return in_array($status, array('open', 'under_review', 'won', 'lost', 'accepted'), true);
+        }
+
+        private function is_chargeback_dispute_status($status)
+        {
+            return in_array($status, array('open', 'under_review', 'lost', 'accepted'), true);
+        }
+
+        private function get_gateway_transaction_id($parsed_request)
+        {
+            return $this->get_parsed_scalar($parsed_request, array('id', 'transactionId', 'chargeback.transactionId', 'chargeback.gatewayTransactionId'));
+        }
+
+        private function get_external_reference($parsed_request)
+        {
+            return $this->get_parsed_scalar($parsed_request, array('externalReference', 'chargeback.externalReference'));
+        }
+
+        private function get_safe_gateway_context($data, $extra = array())
         {
             $context = $extra;
-            if (!is_array($response_body)) {
+            if (!is_array($data)) {
                 return $context;
             }
-
             $fields = array(
-                'gateway_code' => $this->get_api_scalar($response_body, array('code')),
-                'request_id' => $this->get_api_request_id($response_body),
-                'transaction_id' => $this->get_api_scalar($response_body, array('transactionId')),
-                'external_reference' => $this->get_api_scalar($response_body, array('externalReference')),
-                'dispute_id' => $this->get_api_scalar($response_body, array('disputeId')),
-                'dispute_status' => $this->get_api_scalar($response_body, array('disputeStatus', 'chargebackStatus')),
-                'customer_risk_hold_id' => $this->get_api_scalar($response_body, array('customerRiskHoldId')),
-                'customer_risk_action' => $this->get_api_scalar($response_body, array('customerRiskAction')),
-                'customer_risk_reason' => $this->get_api_scalar($response_body, array('customerRiskReason')),
-                'amount' => $this->get_api_scalar($response_body, array('amount')),
-                'currency' => $this->get_api_scalar($response_body, array('currency')),
+                'request_id' => $this->get_parsed_scalar($data, array('requestId', 'requestID', 'chargeback.requestId', 'chargeback.requestID')),
+                'transaction_id' => $this->get_parsed_scalar($data, array('id', 'transactionId', 'chargeback.transactionId', 'chargeback.gatewayTransactionId')),
+                'external_reference' => $this->get_parsed_scalar($data, array('externalReference', 'chargeback.externalReference')),
+                'dispute_id' => $this->get_parsed_scalar($data, array('disputeId', 'chargebackId', 'chargeback.disputeId', 'chargeback.chargebackId', 'chargeback.id')),
+                'dispute_status' => $this->get_dispute_status($data),
+                'credit_note_id' => $this->get_parsed_scalar($data, array('creditNoteId', 'chargeback.creditNoteId', 'creditNote.id')),
+                'credit_note_number' => $this->get_parsed_scalar($data, array('creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number')),
+                'gateway_code' => $this->get_parsed_scalar($data, array('code')),
+                'amount' => $this->get_parsed_scalar($data, array('amount')),
+                'currency' => $this->get_parsed_scalar($data, array('currency')),
             );
+            if (isset($data['status']) && is_scalar($data['status'])) {
+                $fields['status'] = sanitize_text_field((string)$data['status']);
+            }
             foreach ($fields as $key => $value) {
                 if ($value !== '') {
                     $context[$key] = $value;
@@ -155,32 +183,67 @@ function init_woocommerce_payment_gateway_app()
             return $context;
         }
 
-        private function get_safe_checkout_request_context($payload, $extra = array())
+        private function get_dispute_event_key($parsed_request, $dispute_status, $transaction_id)
         {
-            $context = $extra;
-            if (!is_array($payload)) {
-                return $context;
+            $dispute_id = $this->get_parsed_scalar($parsed_request, array('disputeId', 'chargebackId', 'chargeback.disputeId', 'chargeback.chargebackId', 'chargeback.id'));
+            if ($dispute_id !== '') {
+                return $transaction_id . '|dispute|' . $dispute_id . '|' . $dispute_status;
+            }
+            $request_id = $this->get_parsed_scalar($parsed_request, array('requestId', 'requestID', 'chargeback.requestId', 'chargeback.requestID'));
+            if ($request_id !== '') {
+                return $transaction_id . '|request|' . $request_id . '|' . $dispute_status;
+            }
+            return $transaction_id . '|status|' . $dispute_status;
+        }
+
+        private function add_dispute_order_note($order, $parsed_request, $dispute_status, $transaction_id)
+        {
+            $event_key = $this->get_dispute_event_key($parsed_request, $dispute_status, $transaction_id);
+            $processed_events = $order->get_meta('_payment_gateway_app_dispute_events', true);
+            if (!is_array($processed_events)) {
+                $processed_events = array();
+            }
+            if (in_array($event_key, $processed_events, true)) {
+                if ($this->debug) {
+                    $this->log->info('Duplicate dispute webhook note skipped', $this->get_safe_gateway_context($parsed_request, array(
+                        'source' => 'woocommerce-payment-gateway-app',
+                        'order_id' => $order->get_id(),
+                        'event_key' => $event_key,
+                    )));
+                }
+                return false;
             }
 
-            foreach (array('amount', 'currency', 'externalReference') as $key) {
-                if (isset($payload[$key]) && is_scalar($payload[$key])) {
-                    $context[$key] = sanitize_text_field((string)$payload[$key]);
-                }
+            $parts = array(sprintf(__('Payment Gateway App dispute update: %s. Transaction ID: %s', 'woo-payment-gateway-app'), strtoupper($dispute_status), $transaction_id));
+            $dispute_id = $this->get_parsed_scalar($parsed_request, array('disputeId', 'chargebackId', 'chargeback.disputeId', 'chargeback.chargebackId', 'chargeback.id'));
+            $request_id = $this->get_parsed_scalar($parsed_request, array('requestId', 'requestID', 'chargeback.requestId', 'chargeback.requestID'));
+            $credit_note_number = $this->get_parsed_scalar($parsed_request, array('creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number'));
+            if ($dispute_id !== '') {
+                $parts[] = sprintf(__('Dispute ID: %s', 'woo-payment-gateway-app'), $dispute_id);
             }
-            if (isset($payload['items']) && is_array($payload['items'])) {
-                $context['item_count'] = count($payload['items']);
+            if ($request_id !== '') {
+                $parts[] = sprintf(__('Request ID: %s', 'woo-payment-gateway-app'), $request_id);
             }
-            $context['billing_address_passed'] = isset($payload['billingAddress']);
-            $context['shipping_address_passed'] = isset($payload['shippingAddress']);
-            foreach (array('returnUrl', 'cancelUrl', 'ipnUrl') as $url_key) {
-                if (!empty($payload[$url_key]) && is_string($payload[$url_key])) {
-                    $host = wp_parse_url($payload[$url_key], PHP_URL_HOST);
-                    if (is_string($host) && $host !== '') {
-                        $context[$url_key . '_host'] = sanitize_text_field($host);
-                    }
-                }
+            if ($credit_note_number !== '') {
+                $parts[] = sprintf(__('Credit note: %s', 'woo-payment-gateway-app'), $credit_note_number);
             }
-            return $context;
+            $order->add_order_note(implode(' | ', $parts));
+            $processed_events[] = $event_key;
+            if (count($processed_events) > 50) {
+                $processed_events = array_slice($processed_events, -50);
+            }
+            $order->update_meta_data('_payment_gateway_app_dispute_events', $processed_events);
+            $order->save();
+
+            if ($this->debug) {
+                $this->log->info('Dispute webhook update', $this->get_safe_gateway_context($parsed_request, array(
+                    'source' => 'woocommerce-payment-gateway-app',
+                    'order_id' => $order->get_id(),
+                    'transaction_id' => $transaction_id,
+                    'dispute_status' => $dispute_status,
+                )));
+            }
+            return true;
         }
 
 		// Admin Form
@@ -232,7 +295,7 @@ function init_woocommerce_payment_gateway_app()
                 'debug' => array(
                     'title' => __('Debug Log', 'woo-payment-gateway-app'),
                     'type' => 'checkbox',
-                    'description' => __('Write support-safe request and response metadata to WooCommerce logs.', 'woo-payment-gateway-app'),
+                    'description' => __('Write safe request/response metadata to WooCommerce logs.', 'woo-payment-gateway-app'),
                     'default' => 'no'
                 ),
                 'pass_billing_address' => array(
@@ -287,8 +350,10 @@ function init_woocommerce_payment_gateway_app()
                 $this->log->debug('Creating Payment Session', array(
                     'source' => 'woocommerce-payment-gateway-app',
                     'order_id' => $order_id,
-                    'amount' => round($order->get_total() * 100),
-                    'currency' => get_woocommerce_currency()
+                    'has_email' => $email !== '',
+                    'has_return_url' => $returnurl !== '',
+                    'has_cancel_url' => $cancelurl !== '',
+                    'has_ipn_url' => $ipnurl !== ''
                 ));
             }
 
@@ -458,7 +523,7 @@ function init_woocommerce_payment_gateway_app()
             }
             
             if ($this->debug) {
-                $this->log->debug('Preparing to send request', $this->get_safe_checkout_request_context($hashData, array(
+                $this->log->debug('Preparing to send request', $this->get_safe_gateway_context($hashData, array(
                     'source' => 'woocommerce-payment-gateway-app',
                     'url' => $payment_session_url,
                 )));
@@ -475,6 +540,13 @@ function init_woocommerce_payment_gateway_app()
                     'body' => json_encode($hashData),
                 )
             );
+
+            if ($this->debug && !is_wp_error($response)) {
+                $this->log->debug('Received response', array(
+                    'source' => 'woocommerce-payment-gateway-app',
+                    'response_code' => wp_remote_retrieve_response_code($response),
+                ));
+            }
 
             if (is_wp_error($response)) {
                 $error_message = $response->get_error_message();
@@ -512,6 +584,11 @@ function init_woocommerce_payment_gateway_app()
                     $error_message = __('The total amount of the items does not match the order total. This can be caused by a rounding difference. Please contact support for assistance.', 'woo-payment-gateway-app');
                 }
 
+                // Append the request ID for debugging purposes if it exists.
+                $request_id = $this->get_api_request_id($response_body);
+                if ($request_id !== '') {
+                    $error_message .= ' (Request-ID: ' . esc_html($request_id) . ')';
+                }
                 wc_add_notice(__('Payment session creation failed. Error: ', 'woo-payment-gateway-app') . $error_message, 'error');
 
                 if ($this->debug) {
@@ -545,6 +622,7 @@ function init_woocommerce_payment_gateway_app()
             if ($this->debug) {
                 $this->log->error('Invalid Response', $this->get_safe_gateway_context($response_body, array(
                     'source' => 'woocommerce-payment-gateway-app',
+                    'reason' => 'missing_payment_url',
                 )));
             }
 
@@ -630,34 +708,45 @@ function init_woocommerce_payment_gateway_app()
                 if ($this->debug) {
                     $this->log->error('Invalid JSON in webhook request', array(
                         'source' => 'woocommerce-payment-gateway-app',
-                        'raw_body' => $raw_body,
-                        'json_error' => json_last_error_msg()
+                        'json_error' => json_last_error_msg(),
+                        'raw_body_length' => strlen($raw_body),
                     ));
                 }
                 status_header(400);
                 exit("Invalid JSON");
             }
 
-            if (!isset($parsed_request['externalReference'], $parsed_request['status'], $parsed_request['id']) || !is_numeric($parsed_request['status'])) {
+            $dispute_status = $this->get_dispute_status($parsed_request);
+            $has_dispute_status = $this->is_supported_dispute_status($dispute_status);
+            $external_reference = $this->get_external_reference($parsed_request);
+            $transaction_id = $this->get_gateway_transaction_id($parsed_request);
+            if ($external_reference === '' || $transaction_id === '' || ((!isset($parsed_request['status']) || !is_numeric($parsed_request['status'])) && !$has_dispute_status)) {
                 if ($this->debug) {
-                    $this->log->error('Missing or invalid webhook fields', array(
+                    $this->log->error('Missing or invalid webhook fields', $this->get_safe_gateway_context($parsed_request, array(
                         'source' => 'woocommerce-payment-gateway-app',
-                        'parsed_request' => $parsed_request
-                    ));
+                        'reason' => 'missing_or_invalid_fields',
+                    )));
                 }
                 status_header(400);
                 exit("Missing required fields");
             }
 
-            $order = wc_get_order($parsed_request['externalReference']);
+            $order = wc_get_order($external_reference);
             if (!$order) {
                 status_header(404);
                 exit("Order not found");
             }
+            $status = isset($parsed_request['status']) && is_numeric($parsed_request['status']) ? (int) $parsed_request['status'] : null;
+            if ($has_dispute_status) {
+                $this->add_dispute_order_note($order, $parsed_request, $dispute_status, $transaction_id);
+                if ($this->is_chargeback_dispute_status($dispute_status)) {
+                    $order->update_status('refunded', sprintf(__('Chargeback/dispute %s received. Transaction ID: %s', 'woo-payment-gateway-app'), $dispute_status, $transaction_id));
+                }
+                status_header(200);
+                exit("OK");
+            }
 
-            $transaction_id = sanitize_text_field($parsed_request['id']);
-
-            switch ((int) $parsed_request['status']) {
+            switch ($status) {
                 case 0: // Pending
                     $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
@@ -674,6 +763,9 @@ function init_woocommerce_payment_gateway_app()
                     $order->update_status('refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
                 case 4: // Chargeback/Disputed
+                    if ($dispute_status === 'won') {
+                        break;
+                    }
                     $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
                     break;
                 case -1: // Initiated

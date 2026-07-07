@@ -23,24 +23,20 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Resolve Plugin Version
-        run: |
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            version="${{ github.ref_name }}"
-          else
-            version="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
-            version="${version//\//-}"
-          fi
-          echo "PLUGIN_RELEASE_VERSION=${version}" >> "$GITHUB_ENV"
+      - name: Validate PHP syntax
+        run: php -l woocommerce-payment-gateway-app.php
 
       - name: Update Version in PHP file
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
-          sed -i "s/^\\( \\* Version: \\).*/\\1${PLUGIN_RELEASE_VERSION}/" woocommerce-payment-gateway-app.php
+          sed -i "s/^\\( \\* Version: \\).*/\\1${{ github.ref_name }}/" woocommerce-payment-gateway-app.php
 
       - name: Print Release Version
-        run: echo "Release version is ${PLUGIN_RELEASE_VERSION}"
+        if: startsWith(github.ref, 'refs/tags/')
+        run: echo "Release version is ${{ github.ref_name }}"
 
       - name: Create Subfolder
+        if: startsWith(github.ref, 'refs/tags/')
         run: |
           mkdir -p woocommerce-payment-gateway-app
           find . -maxdepth 1 -type f \
@@ -50,15 +46,16 @@ jobs:
           rm -rf woocommerce-payment-gateway-app/.git* woocommerce-payment-gateway-app/.github
 
       - name: Archive Release
+        if: startsWith(github.ref, 'refs/tags/')
         uses: thedoctor0/zip-release@0.7.6
         with:
           type: "zip"
-          filename: woocommerce-payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
+          filename: woocommerce-payment-gateway-app_v${{ github.ref_name }}.zip
           exclusions: "woocommerce-payment-gateway-app/RELEASE.md *.git* *.github*"
 
       - name: Upload Release
-        if: github.ref_type == 'tag'
+        if: startsWith(github.ref, 'refs/tags/')
         uses: ncipollo/release-action@v1
         with:
-          artifacts: woocommerce-payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
+          artifacts: woocommerce-payment-gateway-app_v${{ github.ref_name }}.zip
           token: ${{ secrets.GITHUB_TOKEN }}
