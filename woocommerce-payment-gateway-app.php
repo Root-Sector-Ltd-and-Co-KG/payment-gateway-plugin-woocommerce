@@ -566,8 +566,15 @@ function init_woocommerce_payment_gateway_app()
             $response_code = wp_remote_retrieve_response_code($response);
             $response_body = json_decode(wp_remote_retrieve_body($response), true);
 
+            if ($this->debug) {
+                $this->log->debug('Received response', array(
+                    'source' => 'woocommerce-payment-gateway-app',
+                    'response_code' => $response_code
+                ));
+            }
+
             if ($response_code !== 200) {
-                $error_message = $this->get_api_error_message(
+                $error_message = $this->format_customer_api_error(
                     $response_body,
                     __('Payment session creation failed due to an unexpected error.', 'woo-payment-gateway-app')
                 );
@@ -619,7 +626,10 @@ function init_woocommerce_payment_gateway_app()
                 )));
             }
 
-            $error_message = $response_body['error'] ?? __('an unexpected error occurred', 'woo-payment-gateway-app');
+            $error_message = $this->format_customer_api_error(
+                $response_body,
+                __('an unexpected error occurred', 'woo-payment-gateway-app')
+            );
             wc_add_notice(__('Payment session creation failed. Reason: ', 'woo-payment-gateway-app') . $error_message, 'error');
             return array(
                 'result' => 'failure',

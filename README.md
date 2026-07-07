@@ -98,12 +98,19 @@ request ID to correlate the customer report with Payment Gateway App logs.
 
 When **Debug Log** is enabled, failed checkout requests and webhook
 verification issues may be written to WooCommerce logs
-(**WooCommerce -> Status -> Logs**, source `woocommerce-payment-gateway-app`).
-The plugin logs safe gateway metadata such as request ID, transaction ID,
-external reference, dispute status, gateway code, amount, and currency instead
-of full checkout request bodies, raw webhook payloads, or full gateway response
-bodies. Keep debug mode **disabled on production stores** unless you are
-actively diagnosing an issue, and restrict log access to trusted administrators.
+(**WooCommerce → Status → Logs**, source `woocommerce-payment-gateway-app`).
+Those entries include safe gateway metadata such as gateway code, request ID,
+transaction ID, external reference, dispute status, and customer-risk-hold
+fields instead of full checkout request bodies or raw gateway response bodies.
+Keep debug mode **disabled on production stores** unless you are actively
+diagnosing an issue, and restrict log access to trusted administrators.
+
+Checkout requests blocked by an unresolved dispute use
+`CHECKOUT_BLOCKED_BY_DISPUTE` and show a customer-safe support message with the
+gateway request ID when available. Final merchant-loss customer risk holds use
+`CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD`; when safe methods are allowed,
+`CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD` asks the customer to choose an available
+bank-transfer option such as wire or Wise.
 
 == Changelog ==
 
@@ -118,6 +125,7 @@ actively diagnosing an issue, and restrict log access to trusted administrators.
 
 = 1.0.4 =
 
+- Enhancement: Display and log customer-risk-hold checkout blocks and safe bank-transfer restrictions with request IDs.
 - Security: Replaced Site Secret Key with dedicated Webhook Signing Secret (`whsec_` prefix) for IPN verification.
 - Security: Added separate API Key field for checkout session authentication.
 - Enhancement: Improved webhook verification with HMAC-SHA256 + timestamp replay protection.
