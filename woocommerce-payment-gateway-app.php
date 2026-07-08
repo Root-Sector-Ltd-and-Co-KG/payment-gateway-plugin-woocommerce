@@ -105,6 +105,26 @@ function init_woocommerce_payment_gateway_app()
             return '';
         }
 
+        private function format_customer_api_error($response_body, $fallback)
+        {
+            $message = trim($this->get_api_error_message($response_body, $fallback));
+            $code = $this->get_parsed_scalar($response_body, array('code'));
+
+            if ($code === 'CHECKOUT_BLOCKED_BY_DISPUTE') {
+                $message = __('Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.', 'woo-payment-gateway-app');
+            } elseif ($code === 'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD') {
+                $message = __('Payment cannot be started because this customer account is under merchant review. Please contact support.', 'woo-payment-gateway-app');
+            } elseif ($code === 'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD') {
+                $message = __('Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.', 'woo-payment-gateway-app');
+            }
+
+            $request_id = $this->get_api_request_id($response_body);
+            if ($request_id !== '') {
+                $message .= ' (Request ID: ' . esc_html($request_id) . ')';
+            }
+            return $message;
+        }
+
         private function get_parsed_scalar($data, $paths)
         {
             foreach ($paths as $path) {
@@ -169,6 +189,9 @@ function init_woocommerce_payment_gateway_app()
                 'credit_note_id' => $this->get_parsed_scalar($data, array('creditNoteId', 'chargeback.creditNoteId', 'creditNote.id')),
                 'credit_note_number' => $this->get_parsed_scalar($data, array('creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number')),
                 'gateway_code' => $this->get_parsed_scalar($data, array('code')),
+                'customer_risk_hold_id' => $this->get_parsed_scalar($data, array('customerRiskHoldId', 'customerRiskHold.id')),
+                'customer_risk_action' => $this->get_parsed_scalar($data, array('customerRiskAction', 'customerRiskHold.action')),
+                'customer_risk_reason' => $this->get_parsed_scalar($data, array('customerRiskReason', 'customerRiskHold.reason')),
                 'amount' => $this->get_parsed_scalar($data, array('amount')),
                 'currency' => $this->get_parsed_scalar($data, array('currency')),
             );
@@ -178,6 +201,34 @@ function init_woocommerce_payment_gateway_app()
             foreach ($fields as $key => $value) {
                 if ($value !== '') {
                     $context[$key] = $value;
+                }
+            }
+            return $context;
+        }
+
+        private function get_safe_checkout_request_context($payload, $extra = array())
+        {
+            $context = $extra;
+            if (!is_array($payload)) {
+                return $context;
+            }
+
+            foreach (array('amount', 'currency', 'externalReference') as $key) {
+                if (isset($payload[$key]) && is_scalar($payload[$key])) {
+                    $context[$key] = sanitize_text_field((string)$payload[$key]);
+                }
+            }
+            if (isset($payload['items']) && is_array($payload['items'])) {
+                $context['item_count'] = count($payload['items']);
+            }
+            $context['billing_address_passed'] = isset($payload['billingAddress']);
+            $context['shipping_address_passed'] = isset($payload['shippingAddress']);
+            foreach (array('returnUrl', 'cancelUrl', 'ipnUrl') as $url_key) {
+                if (!empty($payload[$url_key]) && is_string($payload[$url_key])) {
+                    $host = wp_parse_url($payload[$url_key], PHP_URL_HOST);
+                    if (is_string($host) && $host !== '') {
+                        $context[$url_key . '_host'] = sanitize_text_field($host);
+                    }
                 }
             }
             return $context;
@@ -523,10 +574,11 @@ function init_woocommerce_payment_gateway_app()
             }
             
             if ($this->debug) {
-                $this->log->debug('Preparing to send request', $this->get_safe_gateway_context($hashData, array(
+                $this->log->debug('Preparing to send request', array(
                     'source' => 'woocommerce-payment-gateway-app',
                     'url' => $payment_session_url,
-                )));
+                    'checkout' => $this->get_safe_checkout_request_context($hashData),
+                ));
             }
 
             $response = wp_remote_post(
@@ -566,13 +618,6 @@ function init_woocommerce_payment_gateway_app()
             $response_code = wp_remote_retrieve_response_code($response);
             $response_body = json_decode(wp_remote_retrieve_body($response), true);
 
-            if ($this->debug) {
-                $this->log->debug('Received response', array(
-                    'source' => 'woocommerce-payment-gateway-app',
-                    'response_code' => $response_code
-                ));
-            }
-
             if ($response_code !== 200) {
                 $error_message = $this->format_customer_api_error(
                     $response_body,
@@ -582,12 +627,6 @@ function init_woocommerce_payment_gateway_app()
                 // Check for the specific rounding error and provide a more user-friendly message.
                 if (strpos($error_message, 'sum of item amounts') !== false && strpos($error_message, 'does not match total amount') !== false) {
                     $error_message = __('The total amount of the items does not match the order total. This can be caused by a rounding difference. Please contact support for assistance.', 'woo-payment-gateway-app');
-                }
-
-                // Append the request ID for debugging purposes if it exists.
-                $request_id = $this->get_api_request_id($response_body);
-                if ($request_id !== '') {
-                    $error_message .= ' (Request-ID: ' . esc_html($request_id) . ')';
                 }
                 wc_add_notice(__('Payment session creation failed. Error: ', 'woo-payment-gateway-app') . $error_message, 'error');
 
@@ -607,9 +646,11 @@ function init_woocommerce_payment_gateway_app()
             }
 
             if ($this->debug) {
-                $this->log->debug('Decoded response body', $this->get_safe_gateway_context($response_body, array(
+                $this->log->debug('Decoded response body', array(
                     'source' => 'woocommerce-payment-gateway-app',
-                )));
+                    'response_code' => $response_code,
+                    'has_payment_url' => isset($response_body['paymentUrl']),
+                ));
             }
 
             if (isset($response_body['paymentUrl'])) {
