@@ -4,7 +4,7 @@ Tags: payment gateway, woocommerce, credit card, direct debit, unified checkout
 Requires at least: 6.1
 Tested up to: 6.9.4
 Requires PHP: 8.1
-Stable tag: 1.0.7
+Stable tag: dev
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0
 
@@ -114,7 +114,13 @@ bank-transfer option such as wire or Wise.
 
 == Changelog ==
 
-= 1.0.7 =
+= 1.1.1 =
+
+- Fix: Keep the release archive filename, packaged PHP version, and packaged README stable tag synchronized with the release tag.
+- CI: Reject non-`x.y.z` release tags and releases without a matching changelog entry.
+- Docs: Populate the GitHub release description from the matching changelog section.
+
+= 1.1.0 =
 
 - Enhancement: Display checkout API request IDs in customer-facing failure messages when available.
 - Enhancement: Accept dispute-only webhooks with supported dispute status fields, including nested chargeback status and top-level string `status`.
@@ -122,6 +128,16 @@ bank-transfer option such as wire or Wise.
 - Enhancement: Treat `won` disputes as manual-only trace events while marking non-won disputes as refunded.
 - Security: Sanitize debug logging to avoid full checkout request bodies, raw webhook payloads, and full gateway response bodies.
 - Docs: Document request ID, dispute, credit-note, and manual won-dispute behavior.
+
+= 1.0.6 =
+
+- Fix: Align checkout line-item types with the gateway API by using `goods` and `digital_service` identifiers.
+
+= 1.0.5 =
+
+- Enhancement: Prefer API `message` values for checkout failures while retaining the legacy `error` fallback.
+- Enhancement: Update the default payment description to reference wire transfer options.
+- Docs: Update WordPress compatibility and debug-log security guidance.
 
 = 1.0.4 =
 
