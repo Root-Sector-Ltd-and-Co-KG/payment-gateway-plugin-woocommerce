@@ -4,7 +4,7 @@ Tags: payment gateway, woocommerce, credit card, direct debit, unified checkout
 Requires at least: 6.1
 Tested up to: 6.9.4
 Requires PHP: 8.1
-Stable tag: 1.0.4
+Stable tag: 1.0.7
 License: GPLv3
 License URI: https://www.gnu.org/licenses/gpl-3.0
 
@@ -45,7 +45,7 @@ only a single gateway at checkout. Orders stay in sync via secure webhooks.
    - **Title / Description** – what customers see at checkout
    - **API Domain** – domain of your backend (e.g. `api.payment-gateway.app`)
    - **Site ID** – from Payment Gateway App admin → Sites → Edit
-   - **API Key** – create one under Payment Gateway App admin → API Keys with `checkout:write` scope
+   - **API Key** – create one under Payment Gateway App admin → API Keys with `checkout:create` scope
    - **Webhook Signing Secret** – the `whsec_`-prefixed secret from Payment Gateway App admin → Sites → Edit → Webhook Signing Secret
    - **Debug Log** – enable only while troubleshooting (see **Debug log security** below)
    - **Pass Billing / Shipping Address, Pass Items** – optional extra data

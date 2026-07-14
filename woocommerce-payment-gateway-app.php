@@ -15,6 +15,135 @@
  */
 defined('ABSPATH') || exit;
 
+final class WC_Payment_Gateway_App_Api_Error_Context
+{
+    const MAX_IDENTIFIER_LENGTH = 128;
+    const MAX_PROVIDER_LENGTH = 64;
+    const MAX_PROVIDER_COUNT = 20;
+
+    public static function parse($response_body, $http_status = null)
+    {
+        $data = is_array($response_body) ? $response_body : array();
+        return array(
+            'http_status' => is_numeric($http_status) ? (int)$http_status : null,
+            'code' => self::identifier(self::scalar($data, array('code', 'error.code'))),
+            'request_id' => self::identifier(self::scalar($data, array('requestId', 'requestID', 'error.requestId', 'error.requestID', 'chargeback.requestId', 'chargeback.requestID', 'error.chargeback.requestId', 'error.chargeback.requestID'))),
+            'transaction_id' => self::identifier(self::scalar($data, array('id', 'transactionId', 'error.id', 'error.transactionId', 'chargeback.transactionId', 'chargeback.gatewayTransactionId', 'error.chargeback.transactionId', 'error.chargeback.gatewayTransactionId'))),
+            'external_reference' => self::identifier(self::scalar($data, array('externalReference', 'error.externalReference', 'chargeback.externalReference', 'error.chargeback.externalReference'))),
+            'amount' => self::numeric_value(self::value($data, array('amount', 'error.amount'))),
+            'currency' => self::identifier(self::scalar($data, array('currency', 'error.currency'))),
+            'dispute_date' => self::identifier(self::scalar($data, array('disputeDate', 'transactionDate', 'error.disputeDate', 'error.transactionDate'))),
+            'gateway_status' => self::identifier(self::scalar($data, array('status', 'error.status'))),
+            'dispute_id' => self::identifier(self::scalar($data, array('disputeId', 'chargebackId', 'error.disputeId', 'error.chargebackId', 'chargeback.disputeId', 'chargeback.id', 'error.chargeback.disputeId', 'error.chargeback.id'))),
+            'dispute_status' => self::identifier(self::scalar($data, array('disputeStatus', 'error.disputeStatus', 'chargeback.disputeStatus', 'chargeback.status', 'error.chargeback.disputeStatus', 'error.chargeback.status'))),
+            'chargeback_status' => self::identifier(self::scalar($data, array('chargebackStatus', 'error.chargebackStatus', 'chargeback.chargebackStatus', 'error.chargeback.chargebackStatus'))),
+            'credit_note_id' => self::identifier(self::scalar($data, array('creditNoteId', 'error.creditNoteId', 'chargeback.creditNoteId', 'creditNote.id', 'error.chargeback.creditNoteId', 'error.creditNote.id'))),
+            'credit_note_number' => self::identifier(self::scalar($data, array('creditNoteNumber', 'error.creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number', 'error.chargeback.creditNoteNumber', 'error.creditNote.number'))),
+            'customer_risk_hold_id' => self::identifier(self::scalar($data, array('customerRiskHoldId', 'customerRiskHold.id', 'error.customerRiskHoldId', 'error.customerRiskHold.id'))),
+            'customer_risk_action' => self::action(self::scalar($data, array('customerRiskAction', 'customerRiskHold.action', 'error.customerRiskAction', 'error.customerRiskHold.action'))),
+            'customer_risk_reason' => self::identifier(self::scalar($data, array('customerRiskReason', 'customerRiskHold.reason', 'error.customerRiskReason', 'error.customerRiskHold.reason'))),
+            'allowed_provider_types' => self::identifier_list(self::array_value($data, array('allowedProviderTypes', 'customerRiskHold.allowedProviderTypes', 'error.allowedProviderTypes', 'error.customerRiskHold.allowedProviderTypes'))),
+            'allowed_provider_ids' => self::identifier_list(self::array_value($data, array('allowedProviderIds', 'customerRiskHold.allowedProviderIds', 'error.allowedProviderIds', 'error.customerRiskHold.allowedProviderIds'))),
+        );
+    }
+
+    public static function customer_message(array $context, $fallback, array $messages = array())
+    {
+        $messages += array(
+            'CHECKOUT_BLOCKED_BY_DISPUTE' => 'Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.',
+            'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD' => 'Payment cannot be started because this customer account is under merchant review. Please contact support.',
+            'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD' => 'Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.',
+        );
+        $code = isset($context['code']) ? (string)$context['code'] : '';
+        $message = isset($messages[$code]) ? $messages[$code] : trim((string)$fallback);
+        if ($message === '') {
+            $message = 'Payment session creation failed due to an unexpected gateway response.';
+        }
+        if (!empty($context['request_id'])) {
+            $message .= ' Request ID: ' . $context['request_id'];
+        }
+        return $message;
+    }
+
+    public static function log_context(array $context, array $extra = array())
+    {
+        $allowed = array('http_status', 'code', 'request_id', 'transaction_id', 'external_reference', 'amount', 'currency', 'dispute_date', 'gateway_status', 'dispute_id', 'dispute_status', 'chargeback_status', 'credit_note_id', 'credit_note_number', 'customer_risk_hold_id', 'customer_risk_action', 'customer_risk_reason', 'allowed_provider_types', 'allowed_provider_ids');
+        foreach ($allowed as $key) {
+            if (!array_key_exists($key, $context) || $context[$key] === '' || $context[$key] === null || $context[$key] === array()) {
+                continue;
+            }
+            $extra[$key] = $context[$key];
+        }
+        return $extra;
+    }
+
+    private static function value(array $data, array $paths)
+    {
+        foreach ($paths as $path) {
+            $value = $data;
+            foreach (explode('.', $path) as $part) {
+                if (!is_array($value) || !array_key_exists($part, $value)) {
+                    continue 2;
+                }
+                $value = $value[$part];
+            }
+            return $value;
+        }
+        return null;
+    }
+
+    private static function scalar(array $data, array $paths)
+    {
+        $value = self::value($data, $paths);
+        return is_scalar($value) ? trim((string)$value) : '';
+    }
+
+    private static function array_value(array $data, array $paths)
+    {
+        $value = self::value($data, $paths);
+        return is_array($value) ? $value : array();
+    }
+
+    private static function identifier($value, $max_length = self::MAX_IDENTIFIER_LENGTH)
+    {
+        $value = trim((string)$value);
+        if ($value === '' || strlen($value) > $max_length || !preg_match('/\A[A-Za-z0-9._:-]+\z/', $value)) {
+            return '';
+        }
+        return $value;
+    }
+
+    private static function action($value)
+    {
+        $value = self::identifier($value);
+        return in_array($value, array('block_all', 'manual_review', 'allow_provider_types'), true) ? $value : '';
+    }
+
+    private static function identifier_list(array $values)
+    {
+        $result = array();
+        foreach ($values as $value) {
+            if (!is_scalar($value)) {
+                continue;
+            }
+            $identifier = self::identifier($value, self::MAX_PROVIDER_LENGTH);
+            if ($identifier === '' || in_array($identifier, $result, true)) {
+                continue;
+            }
+            $result[] = $identifier;
+            if (count($result) >= self::MAX_PROVIDER_COUNT) {
+                break;
+            }
+        }
+        return $result;
+    }
+
+    private static function numeric_value($value)
+    {
+        return is_numeric($value) ? $value + 0 : null;
+    }
+}
+
 add_action('plugins_loaded', 'init_woocommerce_payment_gateway_app', 0);
 
 function init_woocommerce_payment_gateway_app()
@@ -70,59 +199,13 @@ function init_woocommerce_payment_gateway_app()
             add_action('woocommerce_thankyou_' . $this->id, array($this, 'add_status_check_to_thankyou'), 20);
         }
 
-        /**
-         * Prefer API `message`, then legacy `error` field.
-         *
-         * @param array<string, mixed>|null $response_body
-         */
-        private function get_api_error_message($response_body, $fallback)
+        private function format_customer_api_error($context, $fallback)
         {
-            if (!is_array($response_body)) {
-                return $fallback;
-            }
-            if (!empty($response_body['message']) && is_string($response_body['message'])) {
-                return $response_body['message'];
-            }
-            if (!empty($response_body['error']) && is_string($response_body['error'])) {
-                return $response_body['error'];
-            }
-            return $fallback;
-        }
-
-        private function get_api_request_id($response_body)
-        {
-            if (!is_array($response_body)) {
-                return '';
-            }
-            foreach (array('requestId', 'requestID') as $key) {
-                if (!empty($response_body[$key]) && is_scalar($response_body[$key])) {
-                    return sanitize_text_field((string)$response_body[$key]);
-                }
-                if (!empty($response_body['chargeback']) && is_array($response_body['chargeback']) && !empty($response_body['chargeback'][$key]) && is_scalar($response_body['chargeback'][$key])) {
-                    return sanitize_text_field((string)$response_body['chargeback'][$key]);
-                }
-            }
-            return '';
-        }
-
-        private function format_customer_api_error($response_body, $fallback)
-        {
-            $message = trim($this->get_api_error_message($response_body, $fallback));
-            $code = $this->get_parsed_scalar($response_body, array('code'));
-
-            if ($code === 'CHECKOUT_BLOCKED_BY_DISPUTE') {
-                $message = __('Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.', 'woo-payment-gateway-app');
-            } elseif ($code === 'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD') {
-                $message = __('Payment cannot be started because this customer account is under merchant review. Please contact support.', 'woo-payment-gateway-app');
-            } elseif ($code === 'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD') {
-                $message = __('Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.', 'woo-payment-gateway-app');
-            }
-
-            $request_id = $this->get_api_request_id($response_body);
-            if ($request_id !== '') {
-                $message .= ' (Request ID: ' . esc_html($request_id) . ')';
-            }
-            return $message;
+            return WC_Payment_Gateway_App_Api_Error_Context::customer_message($context, $fallback, array(
+                'CHECKOUT_BLOCKED_BY_DISPUTE' => __('Payment cannot be started because an unresolved dispute is being reviewed. Please contact support.', 'woo-payment-gateway-app'),
+                'CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD' => __('Payment cannot be started because this customer account is under merchant review. Please contact support.', 'woo-payment-gateway-app'),
+                'CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD' => __('Only bank transfer payment methods are available for this account. Please choose an available bank transfer option or contact support.', 'woo-payment-gateway-app'),
+            ));
         }
 
         private function get_parsed_scalar($data, $paths)
@@ -176,34 +259,10 @@ function init_woocommerce_payment_gateway_app()
 
         private function get_safe_gateway_context($data, $extra = array())
         {
-            $context = $extra;
-            if (!is_array($data)) {
-                return $context;
-            }
-            $fields = array(
-                'request_id' => $this->get_parsed_scalar($data, array('requestId', 'requestID', 'chargeback.requestId', 'chargeback.requestID')),
-                'transaction_id' => $this->get_parsed_scalar($data, array('id', 'transactionId', 'chargeback.transactionId', 'chargeback.gatewayTransactionId')),
-                'external_reference' => $this->get_parsed_scalar($data, array('externalReference', 'chargeback.externalReference')),
-                'dispute_id' => $this->get_parsed_scalar($data, array('disputeId', 'chargebackId', 'chargeback.disputeId', 'chargeback.chargebackId', 'chargeback.id')),
-                'dispute_status' => $this->get_dispute_status($data),
-                'credit_note_id' => $this->get_parsed_scalar($data, array('creditNoteId', 'chargeback.creditNoteId', 'creditNote.id')),
-                'credit_note_number' => $this->get_parsed_scalar($data, array('creditNoteNumber', 'chargeback.creditNoteNumber', 'creditNote.number')),
-                'gateway_code' => $this->get_parsed_scalar($data, array('code')),
-                'customer_risk_hold_id' => $this->get_parsed_scalar($data, array('customerRiskHoldId', 'customerRiskHold.id')),
-                'customer_risk_action' => $this->get_parsed_scalar($data, array('customerRiskAction', 'customerRiskHold.action')),
-                'customer_risk_reason' => $this->get_parsed_scalar($data, array('customerRiskReason', 'customerRiskHold.reason')),
-                'amount' => $this->get_parsed_scalar($data, array('amount')),
-                'currency' => $this->get_parsed_scalar($data, array('currency')),
+            return WC_Payment_Gateway_App_Api_Error_Context::log_context(
+                WC_Payment_Gateway_App_Api_Error_Context::parse($data),
+                $extra
             );
-            if (isset($data['status']) && is_scalar($data['status'])) {
-                $fields['status'] = sanitize_text_field((string)$data['status']);
-            }
-            foreach ($fields as $key => $value) {
-                if ($value !== '') {
-                    $context[$key] = $value;
-                }
-            }
-            return $context;
         }
 
         private function get_safe_checkout_request_context($payload, $extra = array())
@@ -617,10 +676,11 @@ function init_woocommerce_payment_gateway_app()
 
             $response_code = wp_remote_retrieve_response_code($response);
             $response_body = json_decode(wp_remote_retrieve_body($response), true);
+            $error_context = WC_Payment_Gateway_App_Api_Error_Context::parse($response_body, $response_code);
 
             if ($response_code !== 200) {
                 $error_message = $this->format_customer_api_error(
-                    $response_body,
+                    $error_context,
                     __('Payment session creation failed due to an unexpected error.', 'woo-payment-gateway-app')
                 );
 
@@ -631,7 +691,7 @@ function init_woocommerce_payment_gateway_app()
                 wc_add_notice(__('Payment session creation failed. Error: ', 'woo-payment-gateway-app') . $error_message, 'error');
 
                 if ($this->debug) {
-                    $this->log->error('Unexpected Response Code', $this->get_safe_gateway_context($response_body, array(
+                    $this->log->error('Unexpected Response Code', WC_Payment_Gateway_App_Api_Error_Context::log_context($error_context, array(
                         'source' => 'woocommerce-payment-gateway-app',
                         'response_code' => $response_code,
                     )));
@@ -668,7 +728,7 @@ function init_woocommerce_payment_gateway_app()
             }
 
             $error_message = $this->format_customer_api_error(
-                $response_body,
+                $error_context,
                 __('an unexpected error occurred', 'woo-payment-gateway-app')
             );
             wc_add_notice(__('Payment session creation failed. Reason: ', 'woo-payment-gateway-app') . $error_message, 'error');
@@ -695,7 +755,7 @@ function init_woocommerce_payment_gateway_app()
                 ));
             }
 
-            // --- Webhook Signature Verification (HMAC-SHA256 signed with API Key) ---
+            // --- Webhook Signature Verification (HMAC-SHA256 signed with the webhook secret) ---
             $received_timestamp = $_SERVER['HTTP_X_SIGNATURE_TIMESTAMP'] ?? null;
             $received_signature = $_SERVER['HTTP_X_SIGNATURE_HMAC_SHA256'] ?? null;
 
