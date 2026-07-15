@@ -94,6 +94,23 @@ Checkout requests blocked by an unresolved dispute show a customer-safe error
 message and include the gateway request ID when the API provides one. Use that
 request ID to correlate the customer report with Payment Gateway App logs.
 
+== Customer risk holds ==
+
+Customer risk holds configured in Payment Gateway App are enforced when the
+plugin creates a checkout session. A final block
+(`CHECKOUT_BLOCKED_BY_CUSTOMER_HOLD`) stops checkout and asks the customer to
+contact support. A restricted hold
+(`CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD`) stops the current attempt and asks the
+customer to choose an allowed bank-transfer method. Existing successful
+checkout responses continue to redirect to the hosted payment page.
+
+Customer notices use fixed, translated text and may include only a sanitized
+gateway request ID. Even with Debug Log enabled, the plugin records only
+bounded diagnostic fields such as the error code, request ID, hold ID/action,
+and allowed provider identifiers. It never logs the raw API response, customer
+data, API credentials, or backend error message. With Debug Log disabled, these
+failures do not create log entries.
+
 == Debug log security ==
 
 When **Debug Log** is enabled, failed checkout requests and webhook
@@ -116,6 +133,7 @@ bank-transfer option such as wire or Wise.
 
 = 1.0.7 =
 
+- Enhancement: Enforce customer risk hold checkout blocks and safe provider restrictions with customer-safe notices.
 - Enhancement: Display checkout API request IDs in customer-facing failure messages when available.
 - Enhancement: Accept dispute-only webhooks with supported dispute status fields, including nested chargeback status and top-level string `status`.
 - Enhancement: Add traceable dispute order notes and idempotent duplicate-note handling for webhook retries.
