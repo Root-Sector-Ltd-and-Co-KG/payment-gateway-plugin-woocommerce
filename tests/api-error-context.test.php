@@ -62,6 +62,21 @@ assertTrueValue(!array_key_exists('message', $logContext), 'Raw backend messages
 assertTrueValue(!array_key_exists('authorization', $logContext), 'Credentials must never be logged.');
 assertTrueValue(!array_key_exists('billingAddress', $logContext), 'Billing data must never be logged.');
 
+$disputeContext = WC_Payment_Gateway_App_Api_Error_Context::parse(array(
+    'amount' => 1234,
+    'currency' => 'EUR',
+    'chargeback' => array(
+        'id' => 'dispute-123',
+        'status' => 'under_review',
+        'creditNoteNumber' => 'CN-123',
+    ),
+));
+assertSameValue(1234, $disputeContext['amount'], 'Extracting the helper must preserve safe amount parsing.');
+assertSameValue('EUR', $disputeContext['currency'], 'Extracting the helper must preserve safe currency parsing.');
+assertSameValue('dispute-123', $disputeContext['dispute_id'], 'Extracting the helper must preserve nested dispute IDs.');
+assertSameValue('under_review', $disputeContext['dispute_status'], 'Extracting the helper must preserve nested dispute statuses.');
+assertSameValue('CN-123', $disputeContext['credit_note_number'], 'Extracting the helper must preserve nested credit-note metadata.');
+
 $customerMessage = WC_Payment_Gateway_App_Api_Error_Context::customer_message(
     $context,
     'Payment session creation failed due to an unexpected gateway response.'
