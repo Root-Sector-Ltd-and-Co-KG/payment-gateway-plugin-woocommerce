@@ -216,6 +216,13 @@ final class WC_Payment_Gateway_App_IPN_Request
         if (!isset($payload['occurredAt']) || !self::valid_occurred_at($payload['occurredAt'])) {
             return self::failure('invalid_occurred_at');
         }
+        if (
+            !isset($payload['status'])
+            || !is_int($payload['status'])
+            || !in_array($payload['status'], array(-2, -1, 0, 1, 2, 3, 4), true)
+        ) {
+            return self::failure('invalid_status');
+        }
 
         return self::success(2, $payload);
     }

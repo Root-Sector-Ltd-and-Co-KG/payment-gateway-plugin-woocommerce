@@ -41,7 +41,7 @@ function signedHeaders(string $body, string $secret, int $timestamp, ?string $ve
     return $headers;
 }
 
-function v2Payload(string $deliveryId, int $eventVersion, int $status = 1): array
+function v2Payload(string $deliveryId, int $eventVersion, $status = 1): array
 {
     return array(
         'schemaVersion' => 2,
@@ -109,6 +109,86 @@ $invalidDate['occurredAt'] = '2026-02-30T18:30:00Z';
 $invalidDateBody = json_encode($invalidDate, JSON_THROW_ON_ERROR);
 $invalidDateResult = WC_Payment_Gateway_App_IPN_Request::verify($invalidDateBody, signedHeaders($invalidDateBody, $secret, $now, '2', 'delivery-date'), $secret, $now);
 ipnAssertSame(false, $invalidDateResult['ok'], 'An impossible occurredAt date must be rejected.');
+
+// Invalid payment statuses must be rejected before they can reserve durable event state.
+$statusIntegrityOrder = new FakeIPNOrder();
+$statusIntegrityEffects = 0;
+$invalidStatusPayloads = array(
+    'fractional' => v2Payload('delivery-status-fractional', 10, 1.9),
+    'numeric_string' => v2Payload('delivery-status-numeric-string', 11, '1'),
+    'unsupported_integer' => v2Payload('delivery-status-unsupported', 12, 5),
+    'missing' => v2Payload('delivery-status-missing', 13),
+);
+unset($invalidStatusPayloads['missing']['status']);
+
+$statusRejections = array();
+foreach ($invalidStatusPayloads as $case => $invalidStatusPayload) {
+    $invalidStatusBody = json_encode($invalidStatusPayload, JSON_THROW_ON_ERROR);
+    $invalidStatusResult = WC_Payment_Gateway_App_IPN_Request::verify(
+        $invalidStatusBody,
+        signedHeaders($invalidStatusBody, $secret, $now, '2', $invalidStatusPayload['deliveryId']),
+        $secret,
+        $now
+    );
+    $statusRejections[$case] = array($invalidStatusResult['ok'], $invalidStatusResult['code'] ?? null);
+    if ($invalidStatusResult['ok']) {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $statusIntegrityOrder,
+            'transaction-status-integrity',
+            $invalidStatusResult['payload'],
+            $invalidStatusBody,
+            function () use (&$statusIntegrityEffects): void {
+                $statusIntegrityEffects++;
+            }
+        );
+    }
+}
+
+$validAfterInvalidPayload = v2Payload('delivery-status-valid', 1, 1);
+$validAfterInvalidBody = json_encode($validAfterInvalidPayload, JSON_THROW_ON_ERROR);
+$validAfterInvalidVerification = WC_Payment_Gateway_App_IPN_Request::verify(
+    $validAfterInvalidBody,
+    signedHeaders($validAfterInvalidBody, $secret, $now, '2', 'delivery-status-valid'),
+    $secret,
+    $now
+);
+$validAfterInvalidResult = $validAfterInvalidVerification['ok']
+    ? WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $statusIntegrityOrder,
+        'transaction-status-integrity',
+        $validAfterInvalidVerification['payload'],
+        $validAfterInvalidBody,
+        static function (): void {
+        }
+    )
+    : 'verification_failed';
+$statusIntegrityState = $statusIntegrityOrder->get_meta(
+    WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-status-integrity'),
+    true
+);
+
+ipnAssertSame(
+    array(
+        'rejections' => array(
+            'fractional' => array(false, 'invalid_status'),
+            'numeric_string' => array(false, 'invalid_status'),
+            'unsupported_integer' => array(false, 'invalid_status'),
+            'missing' => array(false, 'invalid_status'),
+        ),
+        'invalidEffects' => 0,
+        'validAfterResult' => 'applied',
+        'highestEventVersion' => 1,
+        'trace' => array('save', 'save'),
+    ),
+    array(
+        'rejections' => $statusRejections,
+        'invalidEffects' => $statusIntegrityEffects,
+        'validAfterResult' => $validAfterInvalidResult,
+        'highestEventVersion' => $statusIntegrityState['highestEventVersion'] ?? null,
+        'trace' => $statusIntegrityOrder->trace,
+    ),
+    'Invalid v2 payment statuses must not mutate effects, deduplication, or highest event version.'
+);
 
 // If the first acknowledgement is lost, a newly signed resend must not repeat effects.
 $order = new FakeIPNOrder();
