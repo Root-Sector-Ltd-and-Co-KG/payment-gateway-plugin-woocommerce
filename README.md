@@ -59,13 +59,28 @@ The plugin registers a webhook endpoint automatically at:
 `[YOUR-SITE]/wc-api/wc_payment_gateway_app`
 
 When a transaction status changes, Payment Gateway App sends a POST
-request to this URL. Each request includes two signature headers:
+request to this URL. Every request includes two signature headers:
 
 - `X-Signature-Timestamp` - Unix timestamp (seconds) of when the request was signed
 - `X-Signature-HMAC-SHA256` - HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret
 
 The plugin verifies both headers before processing. If verification
 fails the request is rejected and logged (when Debug Log is enabled).
+
+IPN v2 additionally requires `X-IPN-Version: 2` and
+`X-IPN-Delivery-ID`. The signed JSON body carries the same `deliveryId`,
+`schemaVersion: 2`, a transaction-scoped monotonic `eventVersion`, and an
+RFC 3339 `occurredAt` timestamp. The plugin rejects inconsistent v2 metadata,
+stores only bounded delivery identifiers and body hashes through WooCommerce
+order CRUD, acknowledges duplicate or older events without repeating their
+effects, and prevents a late status from replacing a newer transaction state.
+This storage path remains compatible with WooCommerce HPOS.
+
+During the announced migration window, existing sites without an IPN version
+header continue to use the v1 receiver. Upgrade this plugin before opting the
+site into IPN v2 in Payment Gateway App. Once a site is configured for v2, do
+not downgrade the plugin to a version that predates v2 support. V1 retirement
+will be announced separately with its removal release and deadline.
 
 If you suspect your Webhook Signing Secret has been compromised,
 regenerate it in Payment Gateway App admin -> Sites -> Edit and update
@@ -112,7 +127,23 @@ gateway request ID when available. Final merchant-loss customer risk holds use
 `CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD` asks the customer to choose an available
 bank-transfer option such as wire or Wise.
 
+== Upgrade Notice ==
+
+= 1.2.0 =
+
+Adds the IPN v2 receiver required for durable 48-hour delivery retries. Install
+this plugin version before opting a WooCommerce site into IPN v2. Existing v1
+sites continue working during the bounded migration window; no automatic
+downgrade from v2 is supported.
+
 == Changelog ==
+
+= 1.2.0 =
+
+- Enhancement: Add signed IPN v2 contract validation and stable delivery identity checks.
+- Reliability: Durably acknowledge duplicate and out-of-order transaction events without repeating WooCommerce effects.
+- Compatibility: Persist receiver state through WooCommerce order CRUD for HPOS and legacy order storage.
+- Migration: Retain v1 handling for the announced migration window and document the required v2 opt-in order.
 
 = 1.1.1 =
 

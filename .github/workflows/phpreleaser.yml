@@ -29,6 +29,7 @@ jobs:
         run: |
           find . -name '*.php' -print0 | xargs -0 -n1 php -l
           php tests/api-error-context.test.php
+          php tests/ipn-v2-receiver.test.php
           php tests/release-workflow.test.php
 
       - name: Prepare release metadata

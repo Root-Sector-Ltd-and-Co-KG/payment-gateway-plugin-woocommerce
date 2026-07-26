@@ -72,6 +72,7 @@ try {
     $workflow = file_get_contents(dirname(__DIR__) . '/.github/workflows/phpreleaser.yml');
     releaseAssertContains('- "**"', $workflow, 'The workflow must validate every tag name, including tags containing slashes.');
     releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ github.ref_name }}', $workflow, 'The workflow must derive the release version from the Git tag.');
+    releaseAssertContains('php tests/ipn-v2-receiver.test.php', $workflow, 'The workflow must verify the IPN v2 receiver contract before packaging.');
     releaseAssertContains('php scripts/prepare-release.php "$PLUGIN_RELEASE_VERSION"', $workflow, 'The workflow must prepare versioned release files.');
     releaseAssertContains('filename: woocommerce-payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip', $workflow, 'The archive filename must include the release version.');
     releaseAssertContains('woocommerce-payment-gateway-app/scripts/* woocommerce-payment-gateway-app/tests/*', $workflow, 'Development scripts and tests must be excluded from the archive.');
