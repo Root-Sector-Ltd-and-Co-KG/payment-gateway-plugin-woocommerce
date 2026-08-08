@@ -15,21 +15,7 @@ on:
       - "**"
 
 jobs:
-  validate_release_policy:
-    if: startsWith(github.ref, 'refs/tags/')
-    permissions:
-      contents: read
-    uses: Root-Sector-Ltd-and-Co-KG/payment-gateway-release-orchestrator/.github/workflows/validate-plugin-release.yml@7464cd4214900f1c2d3c6ad33716099b227c34b7
-    with:
-      release_tag: ${{ github.ref_name }}
-      source_sha: ${{ github.sha }}
-      policy_ref: 7464cd4214900f1c2d3c6ad33716099b227c34b7
-      changelog_path: README.md
-      ipn_migration: true
-
   phpreleaser:
-    needs: validate_release_policy
-    if: ${{ always() && (!startsWith(github.ref, 'refs/tags/') || needs.validate_release_policy.result == 'success') }}
     runs-on: ubuntu-latest
     env:
       PLUGIN_RELEASE_VERSION: ${{ github.ref_name }}

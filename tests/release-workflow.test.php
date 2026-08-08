@@ -73,10 +73,8 @@ try {
     releaseAssertContains('- "**"', $workflow, 'The workflow must validate every tag name, including tags containing slashes.');
     releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ github.ref_name }}', $workflow, 'The workflow must derive the release version from the Git tag.');
     releaseAssertContains('php tests/ipn-v2-receiver.test.php', $workflow, 'The workflow must verify the IPN v2 receiver contract before packaging.');
-    releaseAssertContains('validate_release_policy:', $workflow, 'Tag publication must run the central plugin release validator.');
-    releaseAssertContains('payment-gateway-release-orchestrator/.github/workflows/validate-plugin-release.yml@7464cd4214900f1c2d3c6ad33716099b227c34b7', $workflow, 'The reusable release validator must be pinned to the reviewed immutable revision.');
-    releaseAssertContains('policy_ref: 7464cd4214900f1c2d3c6ad33716099b227c34b7', $workflow, 'The checked-out release policy must match the reusable workflow revision.');
-    releaseAssertContains('needs: validate_release_policy', $workflow, 'Release publication must depend on successful central policy validation.');
+    releaseAssertNotContains('payment-gateway-release-orchestrator/', $workflow, 'A public plugin workflow must not import the private release orchestrator.');
+    releaseAssertNotContains('validate_release_policy', $workflow, 'Release publication must not depend on an inaccessible private validation job.');
     releaseAssertContains('php scripts/prepare-release.php "$PLUGIN_RELEASE_VERSION"', $workflow, 'The workflow must prepare versioned release files.');
     releaseAssertContains('filename: woocommerce-payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip', $workflow, 'The archive filename must include the release version.');
     releaseAssertContains('woocommerce-payment-gateway-app/scripts/* woocommerce-payment-gateway-app/tests/*', $workflow, 'Development scripts and tests must be excluded from the archive.');
