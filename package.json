@@ -1,0 +1,10 @@
+{
+  "name": "payment-gateway-plugin-woocommerce-integration",
+  "private": true,
+  "scripts": {
+    "wp-env": "wp-env"
+  },
+  "devDependencies": {
+    "@wordpress/env": "11.8.0"
+  }
+}

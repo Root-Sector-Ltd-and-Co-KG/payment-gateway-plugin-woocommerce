@@ -16,6 +16,277 @@
 defined('ABSPATH') || exit;
 require_once __DIR__ . '/includes/class-payment-gateway-app-api-error-context.php';
 
+final class WC_Payment_Gateway_App_IPN_Request
+{
+    const SIGNATURE_TOLERANCE_SECONDS = 300;
+    const MAX_DELIVERY_ID_LENGTH = 128;
+
+    public static function verify($raw_body, array $headers, $webhook_secret, $now = null)
+    {
+        $raw_body = is_string($raw_body) ? $raw_body : '';
+        $timestamp = isset($headers['timestamp']) ? trim((string) $headers['timestamp']) : '';
+        $signature = isset($headers['signature']) ? trim((string) $headers['signature']) : '';
+        $now = $now === null ? time() : (int) $now;
+
+        if ($timestamp === '' || $signature === '') {
+            return self::failure('signature_headers_missing');
+        }
+        if (!preg_match('/\A[0-9]+\z/', $timestamp)) {
+            return self::failure('invalid_signature_timestamp');
+        }
+        if (abs($now - (int) $timestamp) > self::SIGNATURE_TOLERANCE_SECONDS) {
+            return self::failure('signature_timestamp_outside_tolerance');
+        }
+        if (!preg_match('/\A[a-fA-F0-9]{64}\z/', $signature)) {
+            return self::failure('invalid_signature');
+        }
+
+        $expected_signature = hash_hmac('sha256', $timestamp . '.' . $raw_body, (string) $webhook_secret);
+        if (!hash_equals($expected_signature, strtolower($signature))) {
+            return self::failure('invalid_signature');
+        }
+
+        $payload = json_decode($raw_body, true);
+        if (json_last_error() !== JSON_ERROR_NONE || !is_array($payload)) {
+            return self::failure('invalid_json');
+        }
+
+        $version_header = isset($headers['version']) ? trim((string) $headers['version']) : '';
+        if ($version_header === '') {
+            if (array_key_exists('schemaVersion', $payload)) {
+                return self::failure('version_mismatch');
+            }
+            return self::success(1, $payload);
+        }
+        if ($version_header === '1') {
+            if (isset($payload['schemaVersion']) && (int) $payload['schemaVersion'] !== 1) {
+                return self::failure('version_mismatch');
+            }
+            return self::success(1, $payload);
+        }
+        if ($version_header !== '2') {
+            return self::failure('unsupported_ipn_version');
+        }
+
+        if (!isset($payload['schemaVersion']) || !is_int($payload['schemaVersion']) || $payload['schemaVersion'] !== 2) {
+            return self::failure('invalid_schema_version');
+        }
+        if (!isset($payload['deliveryId']) || !self::valid_identifier($payload['deliveryId'])) {
+            return self::failure('invalid_delivery_id');
+        }
+
+        $header_delivery_id = isset($headers['delivery_id']) ? trim((string) $headers['delivery_id']) : '';
+        if (!self::valid_identifier($header_delivery_id)) {
+            return self::failure('invalid_delivery_id');
+        }
+        if (!hash_equals((string) $payload['deliveryId'], $header_delivery_id)) {
+            return self::failure('delivery_id_mismatch');
+        }
+        if (!isset($payload['eventVersion']) || !is_int($payload['eventVersion']) || $payload['eventVersion'] <= 0) {
+            return self::failure('invalid_event_version');
+        }
+        if (!isset($payload['occurredAt']) || !self::valid_occurred_at($payload['occurredAt'])) {
+            return self::failure('invalid_occurred_at');
+        }
+        foreach (array('transactionId', 'gatewayTransactionId', 'external_reference', 'paymentStatus', 'disputeStatus', 'chargebackStatus', 'chargeback') as $legacy_alias) {
+            if (array_key_exists($legacy_alias, $payload)) {
+                return self::failure('legacy_alias_not_allowed');
+            }
+        }
+        if (!self::valid_payload_identity($payload['id'] ?? null)) {
+            return self::failure('invalid_transaction_id');
+        }
+        if (!self::valid_payload_identity($payload['externalReference'] ?? null)) {
+            return self::failure('invalid_external_reference');
+        }
+        if (
+            !isset($payload['status'])
+            || !is_int($payload['status'])
+            || !in_array($payload['status'], array(-2, -1, 0, 1, 2, 3, 4), true)
+        ) {
+            return self::failure('invalid_status');
+        }
+
+        return self::success(2, $payload);
+    }
+
+    private static function valid_identifier($value)
+    {
+        return is_string($value)
+            && $value !== ''
+            && strlen($value) <= self::MAX_DELIVERY_ID_LENGTH
+            && preg_match('/\A[A-Za-z0-9._:-]+\z/', $value) === 1;
+    }
+
+    private static function valid_payload_identity($value)
+    {
+        return is_string($value)
+            && trim($value) !== ''
+            && strlen($value) <= self::MAX_DELIVERY_ID_LENGTH
+            && preg_match('/[\x00-\x1F\x7F]/', $value) !== 1;
+    }
+
+    private static function valid_occurred_at($value)
+    {
+        if (!is_string($value) || strlen($value) > 64) {
+            return false;
+        }
+        if (!preg_match(
+            '/\A(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))\z/',
+            $value,
+            $parts
+        )) {
+            return false;
+        }
+
+        $year = (int) $parts[1];
+        $month = (int) $parts[2];
+        $day = (int) $parts[3];
+        $hour = (int) $parts[4];
+        $minute = (int) $parts[5];
+        $second = (int) $parts[6];
+        $offset_hour = isset($parts[7]) && $parts[7] !== '' ? (int) $parts[7] : 0;
+        $offset_minute = isset($parts[8]) && $parts[8] !== '' ? (int) $parts[8] : 0;
+
+        return checkdate($month, $day, $year)
+            && $hour <= 23
+            && $minute <= 59
+            && $second <= 59
+            && $offset_hour <= 23
+            && $offset_minute <= 59;
+    }
+
+    private static function success($version, array $payload)
+    {
+        return array(
+            'ok' => true,
+            'version' => (int) $version,
+            'payload' => $payload,
+        );
+    }
+
+    private static function failure($code)
+    {
+        return array(
+            'ok' => false,
+            'code' => (string) $code,
+        );
+    }
+}
+
+final class WC_Payment_Gateway_App_IPN_V2_Processor
+{
+    const STATE_FORMAT_VERSION = 1;
+    const MAX_RETAINED_DELIVERIES = 100;
+
+    public static function meta_key($transaction_id)
+    {
+        return '_payment_gateway_app_ipn_v2_' . hash('sha256', (string) $transaction_id);
+    }
+
+    public static function process($order, $transaction_id, array $payload, $raw_body, callable $apply_effect)
+    {
+        $meta_key = self::meta_key($transaction_id);
+        $state = self::load_state($order->get_meta($meta_key, true));
+        $delivery_id = (string) $payload['deliveryId'];
+        $event_version = (int) $payload['eventVersion'];
+        $body_hash = hash('sha256', (string) $raw_body);
+
+        if (isset($state['deliveries'][$delivery_id])) {
+            $delivery = $state['deliveries'][$delivery_id];
+            if (
+                !isset($delivery['eventVersion'], $delivery['bodyHash'], $delivery['phase'])
+                || (int) $delivery['eventVersion'] !== $event_version
+                || !hash_equals((string) $delivery['bodyHash'], $body_hash)
+            ) {
+                return 'conflict';
+            }
+            if ($delivery['phase'] === 'applied') {
+                return 'duplicate';
+            }
+            if ($delivery['phase'] === 'superseded') {
+                return 'outdated';
+            }
+            if ($delivery['phase'] !== 'pending') {
+                throw new UnexpectedValueException('Invalid IPN delivery phase.');
+            }
+            if ($event_version < $state['highestEventVersion']) {
+                $state['deliveries'][$delivery_id]['phase'] = 'superseded';
+                self::save_state($order, $meta_key, $state);
+                return 'outdated';
+            }
+        } else {
+            if ($event_version <= $state['highestEventVersion']) {
+                return 'outdated';
+            }
+            $state['highestEventVersion'] = $event_version;
+            $state['deliveries'][$delivery_id] = array(
+                'eventVersion' => $event_version,
+                'bodyHash' => $body_hash,
+                'phase' => 'pending',
+            );
+            self::save_state($order, $meta_key, $state);
+        }
+
+        $apply_effect($order, $payload);
+
+        $state = self::load_state($order->get_meta($meta_key, true));
+        if (!isset($state['deliveries'][$delivery_id])) {
+            throw new UnexpectedValueException('IPN delivery state disappeared during processing.');
+        }
+        $state['deliveries'][$delivery_id]['phase'] = 'applied';
+        $state = self::trim_deliveries($state);
+        self::save_state($order, $meta_key, $state);
+        return 'applied';
+    }
+
+    private static function load_state($stored_state)
+    {
+        if ($stored_state === '' || $stored_state === null || $stored_state === false) {
+            return array(
+                'formatVersion' => self::STATE_FORMAT_VERSION,
+                'highestEventVersion' => 0,
+                'deliveries' => array(),
+            );
+        }
+        if (
+            !is_array($stored_state)
+            || !isset($stored_state['formatVersion'], $stored_state['highestEventVersion'], $stored_state['deliveries'])
+            || (int) $stored_state['formatVersion'] !== self::STATE_FORMAT_VERSION
+            || !is_int($stored_state['highestEventVersion'])
+            || $stored_state['highestEventVersion'] < 0
+            || !is_array($stored_state['deliveries'])
+        ) {
+            throw new UnexpectedValueException('Invalid persisted IPN v2 state.');
+        }
+        return $stored_state;
+    }
+
+    private static function save_state($order, $meta_key, array $state)
+    {
+        $order->update_meta_data($meta_key, $state);
+        $order->save();
+    }
+
+    private static function trim_deliveries(array $state)
+    {
+        while (count($state['deliveries']) > self::MAX_RETAINED_DELIVERIES) {
+            $removed = false;
+            foreach ($state['deliveries'] as $delivery_id => $delivery) {
+                if (isset($delivery['phase']) && $delivery['phase'] === 'applied') {
+                    unset($state['deliveries'][$delivery_id]);
+                    $removed = true;
+                    break;
+                }
+            }
+            if (!$removed) {
+                break;
+            }
+        }
+        return $state;
+    }
+}
+
 add_action('plugins_loaded', 'init_woocommerce_payment_gateway_app', 0);
 
 function init_woocommerce_payment_gateway_app()
@@ -627,67 +898,27 @@ function init_woocommerce_payment_gateway_app()
                 ));
             }
 
-            // --- Webhook Signature Verification (HMAC-SHA256 signed with the webhook secret) ---
-            $received_timestamp = $_SERVER['HTTP_X_SIGNATURE_TIMESTAMP'] ?? null;
-            $received_signature = $_SERVER['HTTP_X_SIGNATURE_HMAC_SHA256'] ?? null;
-
-            if (!$received_timestamp || !$received_signature) {
+            $verified_request = WC_Payment_Gateway_App_IPN_Request::verify(
+                $raw_body,
+                array(
+                    'timestamp' => $_SERVER['HTTP_X_SIGNATURE_TIMESTAMP'] ?? null,
+                    'signature' => $_SERVER['HTTP_X_SIGNATURE_HMAC_SHA256'] ?? null,
+                    'version' => $_SERVER['HTTP_X_IPN_VERSION'] ?? null,
+                    'delivery_id' => $_SERVER['HTTP_X_IPN_DELIVERY_ID'] ?? null,
+                ),
+                $this->webhook_secret
+            );
+            if (!$verified_request['ok']) {
                 if ($this->debug) {
-                    $this->log->error('Webhook signature headers missing', array('source' => 'woocommerce-payment-gateway-app'));
-                }
-                status_header(400);
-                exit("Signature headers missing");
-            }
-
-            // Check if timestamp is recent (within 5 minutes) to prevent replay attacks.
-            if (!is_numeric($received_timestamp)) {
-                if ($this->debug) {
-                    $this->log->error('Invalid webhook timestamp', array(
+                    $this->log->error('Webhook request rejected', array(
                         'source' => 'woocommerce-payment-gateway-app',
-                        'received_timestamp' => $received_timestamp
+                        'reason' => $verified_request['code'],
                     ));
                 }
                 status_header(400);
-                exit("Invalid signature timestamp");
+                exit("Invalid webhook request");
             }
-
-            if (abs(time() - (int)$received_timestamp) > 300) {
-                if ($this->debug) {
-                    $this->log->error('Webhook timestamp is too old', array(
-                        'source' => 'woocommerce-payment-gateway-app',
-                        'received_timestamp' => $received_timestamp
-                    ));
-                }
-                status_header(400);
-                exit("Webhook timestamp too old");
-            }
-
-            // Recreate the signature string and verify using the webhook signing secret.
-            $string_to_sign = $received_timestamp . '.' . $raw_body;
-            $computed_hash = hash_hmac('sha256', $string_to_sign, $this->webhook_secret);
-
-            // Securely compare the signatures (timing-safe).
-            if (!hash_equals($computed_hash, $received_signature)) {
-                if ($this->debug) {
-                    $this->log->error('Invalid webhook signature', array('source' => 'woocommerce-payment-gateway-app'));
-                }
-                status_header(400);
-                exit("Invalid signature");
-            }
-            // --- End Webhook Signature Verification ---
-
-            $parsed_request = json_decode($raw_body, true);
-            if (json_last_error() !== JSON_ERROR_NONE || !is_array($parsed_request)) {
-                if ($this->debug) {
-                    $this->log->error('Invalid JSON in webhook request', array(
-                        'source' => 'woocommerce-payment-gateway-app',
-                        'json_error' => json_last_error_msg(),
-                        'raw_body_length' => strlen($raw_body),
-                    ));
-                }
-                status_header(400);
-                exit("Invalid JSON");
-            }
+            $parsed_request = $verified_request['payload'];
 
             $dispute_status = $this->get_dispute_status($parsed_request);
             $has_dispute_status = $this->is_supported_dispute_status($dispute_status);
@@ -709,19 +940,92 @@ function init_woocommerce_payment_gateway_app()
                 status_header(404);
                 exit("Order not found");
             }
-            $status = isset($parsed_request['status']) && is_numeric($parsed_request['status']) ? (int) $parsed_request['status'] : null;
-            if ($has_dispute_status) {
-                $this->add_dispute_order_note($order, $parsed_request, $dispute_status, $transaction_id);
-                if ($this->is_chargeback_dispute_status($dispute_status)) {
-                    $order->update_status('refunded', sprintf(__('Chargeback/dispute %s received. Transaction ID: %s', 'woo-payment-gateway-app'), $dispute_status, $transaction_id));
+
+            if ($verified_request['version'] === 2) {
+                $lock_name = $this->acquire_ipn_v2_lock($order->get_id(), $transaction_id);
+                if ($lock_name === '') {
+                    if ($this->debug) {
+                        $this->log->warning('Webhook delivery lock unavailable', $this->get_safe_gateway_context($parsed_request, array(
+                            'source' => 'woocommerce-payment-gateway-app',
+                            'delivery_id' => $parsed_request['deliveryId'],
+                        )));
+                    }
+                    status_header(503);
+                    exit("Webhook temporarily unavailable");
+                }
+
+                $processing_result = '';
+                try {
+                    // Re-read through WooCommerce CRUD after taking the lock so HPOS and
+                    // posts-table stores both observe the latest delivery state.
+                    $order = wc_get_order($external_reference);
+                    if (!$order) {
+                        $processing_result = 'order_not_found';
+                    } else {
+                        $processing_result = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+                            $order,
+                            $transaction_id,
+                            $parsed_request,
+                            $raw_body,
+                            function ($locked_order, array $event) use ($dispute_status, $transaction_id) {
+                                $this->apply_webhook_effect($locked_order, $event, $dispute_status, $transaction_id, true);
+                            }
+                        );
+                    }
+                } catch (Throwable $error) {
+                    if ($this->debug) {
+                        $this->log->error('Webhook delivery processing failed', $this->get_safe_gateway_context($parsed_request, array(
+                            'source' => 'woocommerce-payment-gateway-app',
+                            'delivery_id' => $parsed_request['deliveryId'],
+                            'error_type' => get_class($error),
+                        )));
+                    }
+                    $processing_result = 'temporary_failure';
+                } finally {
+                    $this->release_ipn_v2_lock($lock_name);
+                }
+
+                if ($processing_result === 'order_not_found') {
+                    status_header(404);
+                    exit("Order not found");
+                }
+                if ($processing_result === 'conflict') {
+                    status_header(409);
+                    exit("Delivery identity conflict");
+                }
+                if ($processing_result === 'temporary_failure') {
+                    status_header(503);
+                    exit("Webhook temporarily unavailable");
                 }
                 status_header(200);
                 exit("OK");
             }
 
+            $this->apply_webhook_effect($order, $parsed_request, $dispute_status, $transaction_id, false);
+            status_header(200);
+            exit("OK");
+        }
+
+        private function apply_webhook_effect($order, array $parsed_request, $dispute_status, $transaction_id, $idempotent_recovery)
+        {
+            $has_dispute_status = $this->is_supported_dispute_status($dispute_status);
+            if ($has_dispute_status) {
+                $this->add_dispute_order_note($order, $parsed_request, $dispute_status, $transaction_id);
+                if ($this->is_chargeback_dispute_status($dispute_status)) {
+                    $this->update_order_status(
+                        $order,
+                        'refunded',
+                        sprintf(__('Chargeback/dispute %s received. Transaction ID: %s', 'woo-payment-gateway-app'), $dispute_status, $transaction_id),
+                        $idempotent_recovery
+                    );
+                }
+                return;
+            }
+
+            $status = isset($parsed_request['status']) && is_numeric($parsed_request['status']) ? (int) $parsed_request['status'] : null;
             switch ($status) {
                 case 0: // Pending
-                    $order->update_status('on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
+                    $this->update_order_status($order, 'on-hold', sprintf(__('Payment pending. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id), $idempotent_recovery);
                     break;
                 case 1: // Completed
                     if (!$order->is_paid()) {
@@ -730,27 +1034,54 @@ function init_woocommerce_payment_gateway_app()
                     }
                     break;
                 case 2: // Failed
-                    $order->update_status('failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
+                    $this->update_order_status($order, 'failed', sprintf(__('Payment failed. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id), $idempotent_recovery);
                     break;
                 case 3: // Refunded
-                    $order->update_status('refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
+                    $this->update_order_status($order, 'refunded', sprintf(__('Payment refunded. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id), $idempotent_recovery);
                     break;
                 case 4: // Chargeback/Disputed
                     if ($dispute_status === 'won') {
                         break;
                     }
-                    $order->update_status('refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
+                    $this->update_order_status($order, 'refunded', sprintf(__('Chargeback received. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id), $idempotent_recovery);
                     break;
                 case -1: // Initiated
-                    $order->update_status('on-hold', sprintf(__('Payment initiated. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
+                    $this->update_order_status($order, 'on-hold', sprintf(__('Payment initiated. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id), $idempotent_recovery);
                     break;
                 case -2: // Cancelled
-                    $order->update_status('cancelled', sprintf(__('Payment cancelled. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id));
+                    $this->update_order_status($order, 'cancelled', sprintf(__('Payment cancelled. Transaction ID: %s', 'woo-payment-gateway-app'), $transaction_id), $idempotent_recovery);
                     break;
             }
+        }
 
-            status_header(200);
-            exit("OK");
+        private function update_order_status($order, $status, $note, $idempotent_recovery)
+        {
+            if ($idempotent_recovery && $order->get_status() === $status) {
+                return;
+            }
+            $order->update_status($status, $note);
+        }
+
+        private function acquire_ipn_v2_lock($order_id, $transaction_id)
+        {
+            global $wpdb;
+            if (!is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
+                return '';
+            }
+            $lock_name = 'mpg_ipn_v2_' . hash('sha1', (string) $order_id . '|' . (string) $transaction_id);
+            $query = $wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock_name, 5);
+            $acquired = $wpdb->get_var($query);
+            return (string) $acquired === '1' ? $lock_name : '';
+        }
+
+        private function release_ipn_v2_lock($lock_name)
+        {
+            global $wpdb;
+            if ($lock_name === '' || !is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
+                return;
+            }
+            $query = $wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name);
+            $wpdb->get_var($query);
         }
 
         /**
