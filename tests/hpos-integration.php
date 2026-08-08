@@ -1,7 +1,5 @@
 <?php
 
-declare(strict_types=1);
-
 use Automattic\WooCommerce\Internal\DataStores\Orders\OrdersTableDataStore;
 use Automattic\WooCommerce\Utilities\OrderUtil;
 
