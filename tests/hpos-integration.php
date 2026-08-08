@@ -25,7 +25,11 @@ hposAssert(OrderUtil::custom_orders_table_usage_is_enabled(), 'HPOS must be enab
 
 $order = wc_create_order();
 hposAssert($order instanceof WC_Order, 'A real WooCommerce order must be created.');
-hposAssert($order->get_data_store() instanceof OrdersTableDataStore, 'Orders must use the HPOS data store.');
+hposAssertSame(
+    OrdersTableDataStore::class,
+    $order->get_data_store()->get_current_class_name(),
+    'Orders must use the HPOS data store.'
+);
 $orderId = $order->get_id();
 $transactionId = 'hpos-transaction-' . $orderId;
 $metaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key($transactionId);
