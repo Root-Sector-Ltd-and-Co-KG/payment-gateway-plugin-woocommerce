@@ -216,6 +216,17 @@ final class WC_Payment_Gateway_App_IPN_Request
         if (!isset($payload['occurredAt']) || !self::valid_occurred_at($payload['occurredAt'])) {
             return self::failure('invalid_occurred_at');
         }
+        foreach (array('transactionId', 'gatewayTransactionId', 'external_reference', 'paymentStatus', 'disputeStatus', 'chargebackStatus', 'chargeback') as $legacy_alias) {
+            if (array_key_exists($legacy_alias, $payload)) {
+                return self::failure('legacy_alias_not_allowed');
+            }
+        }
+        if (!self::valid_payload_identity($payload['id'] ?? null)) {
+            return self::failure('invalid_transaction_id');
+        }
+        if (!self::valid_payload_identity($payload['externalReference'] ?? null)) {
+            return self::failure('invalid_external_reference');
+        }
         if (
             !isset($payload['status'])
             || !is_int($payload['status'])
@@ -233,6 +244,14 @@ final class WC_Payment_Gateway_App_IPN_Request
             && $value !== ''
             && strlen($value) <= self::MAX_DELIVERY_ID_LENGTH
             && preg_match('/\A[A-Za-z0-9._:-]+\z/', $value) === 1;
+    }
+
+    private static function valid_payload_identity($value)
+    {
+        return is_string($value)
+            && trim($value) !== ''
+            && strlen($value) <= self::MAX_DELIVERY_ID_LENGTH
+            && preg_match('/[\x00-\x1F\x7F]/', $value) !== 1;
     }
 
     private static function valid_occurred_at($value)

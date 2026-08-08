@@ -4,8 +4,14 @@ declare(strict_types=1);
 
 define('ABSPATH', __DIR__);
 
-function add_action(): void
+eval('namespace Automattic\\WooCommerce\\Utilities; final class FeaturesUtil { public static array $declarations = array(); public static function declare_compatibility($feature, $file, $compatible): void { self::$declarations[] = array($feature, $file, $compatible); } }');
+
+$ipnRegisteredActions = array();
+
+function add_action($hook, $callback = null): void
 {
+    global $ipnRegisteredActions;
+    $ipnRegisteredActions[$hook][] = $callback;
 }
 
 require dirname(__DIR__) . '/woocommerce-payment-gateway-app.php';
@@ -78,6 +84,15 @@ final class FakeIPNOrder
 $secret = 'whsec_test_receiver_secret';
 $now = 1785088800;
 
+foreach ($ipnRegisteredActions['before_woocommerce_init'] ?? array() as $callback) {
+    $callback();
+}
+ipnAssertSame(
+    array(array('custom_order_tables', dirname(__DIR__) . '/woocommerce-payment-gateway-app.php', true)),
+    \Automattic\WooCommerce\Utilities\FeaturesUtil::$declarations,
+    'The plugin must declare HPOS compatibility through WooCommerce FeaturesUtil.'
+);
+
 // A missing version header remains the bounded v1 compatibility path.
 $v1Body = json_encode(array('id' => 'transaction-123', 'externalReference' => '42', 'status' => 1), JSON_THROW_ON_ERROR);
 $v1 = WC_Payment_Gateway_App_IPN_Request::verify($v1Body, signedHeaders($v1Body, $secret, $now), $secret, $now);
@@ -90,6 +105,59 @@ $body = json_encode($payload, JSON_THROW_ON_ERROR);
 $verified = WC_Payment_Gateway_App_IPN_Request::verify($body, signedHeaders($body, $secret, $now, '2', $deliveryId), $secret, $now);
 ipnAssertSame(true, $verified['ok'], 'A correctly signed and versioned v2 IPN must be accepted.');
 ipnAssertSame(2, $verified['version'], 'The verified request must retain the negotiated IPN version.');
+
+$nonCanonicalCases = array(
+    'alias_only_transaction' => (function (): array {
+        $candidate = v2Payload('delivery-alias-transaction', 2);
+        unset($candidate['id']);
+        $candidate['transactionId'] = 'transaction-123';
+        return $candidate;
+    })(),
+    'alias_only_external_reference' => (function (): array {
+        $candidate = v2Payload('delivery-alias-reference', 3);
+        unset($candidate['externalReference']);
+        $candidate['chargeback'] = array('externalReference' => '42');
+        return $candidate;
+    })(),
+    'hybrid_dispute_status' => (function (): array {
+        $candidate = v2Payload('delivery-hybrid', 4);
+        $candidate['status'] = 1;
+        $candidate['disputeStatus'] = 'lost';
+        return $candidate;
+    })(),
+    'typed_transaction' => (function (): array {
+        $candidate = v2Payload('delivery-typed-transaction', 5);
+        $candidate['id'] = 123;
+        return $candidate;
+    })(),
+    'typed_external_reference' => (function (): array {
+        $candidate = v2Payload('delivery-typed-reference', 6);
+        $candidate['externalReference'] = 42;
+        return $candidate;
+    })(),
+);
+$nonCanonicalResults = array();
+foreach ($nonCanonicalCases as $case => $candidate) {
+    $candidateBody = json_encode($candidate, JSON_THROW_ON_ERROR);
+    $result = WC_Payment_Gateway_App_IPN_Request::verify(
+        $candidateBody,
+        signedHeaders($candidateBody, $secret, $now, '2', $candidate['deliveryId']),
+        $secret,
+        $now
+    );
+    $nonCanonicalResults[$case] = array($result['ok'], $result['code'] ?? null);
+}
+ipnAssertSame(
+    array(
+        'alias_only_transaction' => array(false, 'legacy_alias_not_allowed'),
+        'alias_only_external_reference' => array(false, 'legacy_alias_not_allowed'),
+        'hybrid_dispute_status' => array(false, 'legacy_alias_not_allowed'),
+        'typed_transaction' => array(false, 'invalid_transaction_id'),
+        'typed_external_reference' => array(false, 'invalid_external_reference'),
+    ),
+    $nonCanonicalResults,
+    'IPN v2 must require canonical typed identity fields and reject legacy alias or hybrid payloads.'
+);
 
 $mismatched = WC_Payment_Gateway_App_IPN_Request::verify($body, signedHeaders($body, $secret, $now, '2', 'different-delivery'), $secret, $now);
 ipnAssertSame(false, $mismatched['ok'], 'A v2 delivery header/body mismatch must be rejected.');
