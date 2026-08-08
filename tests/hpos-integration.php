@@ -22,10 +22,10 @@ function hposAssertSame($expected, $actual, string $message): void
 hposAssert(class_exists('WooCommerce'), 'WooCommerce must be active.');
 hposAssert(class_exists('WC_Payment_Gateway_App_IPN_V2_Processor'), 'The payment gateway plugin must be active.');
 hposAssert(OrderUtil::custom_orders_table_usage_is_enabled(), 'HPOS must be enabled.');
-hposAssert(WC_Data_Store::load('order') instanceof OrdersTableDataStore, 'Orders must use the HPOS data store.');
 
 $order = wc_create_order();
 hposAssert($order instanceof WC_Order, 'A real WooCommerce order must be created.');
+hposAssert($order->get_data_store() instanceof OrdersTableDataStore, 'Orders must use the HPOS data store.');
 $orderId = $order->get_id();
 $transactionId = 'hpos-transaction-' . $orderId;
 $metaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key($transactionId);
