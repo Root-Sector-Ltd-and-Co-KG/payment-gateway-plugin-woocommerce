@@ -220,6 +220,16 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             if ($event_version <= $state['highestEventVersion']) {
                 return 'outdated';
             }
+            foreach ($state['deliveries'] as &$known_delivery) {
+                if (
+                    isset($known_delivery['eventVersion'], $known_delivery['phase'])
+                    && $known_delivery['phase'] === 'pending'
+                    && (int) $known_delivery['eventVersion'] < $event_version
+                ) {
+                    $known_delivery['phase'] = 'superseded';
+                }
+            }
+            unset($known_delivery);
             $state['highestEventVersion'] = $event_version;
             $state['deliveries'][$delivery_id] = array(
                 'eventVersion' => $event_version,
@@ -235,8 +245,7 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             $transaction_id,
             static function ($effect_order) use ($apply_effect, $payload) {
                 $apply_effect($effect_order, $payload);
-            },
-            isset($payload['status']) && $payload['status'] === 1
+            }
         );
 
         $state = self::load_state($order->get_meta($meta_key, true));
@@ -301,13 +310,12 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
 
 final class WC_Payment_Gateway_App_IPN_Order_Attempt
 {
-    public static function apply($order, $transaction_id, callable $apply_effect, $establishes_paid_attempt = false)
+    public static function apply($order, $transaction_id, callable $apply_effect)
     {
         $active_transaction_id = trim((string) $order->get_transaction_id());
         if (
             $active_transaction_id !== ''
             && !hash_equals($active_transaction_id, (string) $transaction_id)
-            && (!$establishes_paid_attempt || $order->is_paid())
         ) {
             return 'stale_attempt';
         }
@@ -1015,11 +1023,7 @@ function init_woocommerce_payment_gateway_app()
                         $transaction_id,
                         function ($locked_order) use ($parsed_request, $dispute_status, $transaction_id) {
                             $this->apply_webhook_effect($locked_order, $parsed_request, $dispute_status, $transaction_id, false);
-                        },
-                        !$has_dispute_status
-                            && isset($parsed_request['status'])
-                            && is_numeric($parsed_request['status'])
-                            && (int) $parsed_request['status'] === 1
+                        }
                     );
                 }
             } catch (Throwable $error) {

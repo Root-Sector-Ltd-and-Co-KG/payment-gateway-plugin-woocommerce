@@ -152,6 +152,30 @@ try {
     hposAssert($afterNewerOrder instanceof WC_Order, 'The order must reload after the newer event.');
     hposAssertSame('failed', $afterNewerOrder->get_status(), 'The newer status must be durable.');
 
+    $lateOtherSuccessPayload = array_merge($lateOtherPayload, array(
+        'deliveryId' => 'hpos-other-success-' . $orderId,
+        'eventVersion' => 2,
+        'status' => 1,
+    ));
+    $lateOtherSuccessBody = wp_json_encode($lateOtherSuccessPayload, JSON_THROW_ON_ERROR);
+    $lateOtherSuccessResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $afterNewerOrder,
+        $otherTransactionId,
+        $lateOtherSuccessPayload,
+        $lateOtherSuccessBody,
+        static function (WC_Order $effectOrder) use (&$lateOtherEffects, $otherTransactionId): void {
+            $lateOtherEffects++;
+            $effectOrder->payment_complete($otherTransactionId);
+        }
+    );
+    hposAssertSame('applied', $lateOtherSuccessResult, 'A delayed success for a stale payment attempt must be acknowledged in HPOS.');
+    hposAssertSame(0, $lateOtherEffects, 'A delayed success for a stale payment attempt must not run an HPOS payment effect.');
+
+    $afterLateOtherSuccess = wc_get_order($orderId);
+    hposAssert($afterLateOtherSuccess instanceof WC_Order, 'The order must reload after the stale delayed success.');
+    hposAssertSame('failed', $afterLateOtherSuccess->get_status(), 'A stale delayed success must not reopen the HPOS order.');
+    hposAssertSame($transactionId, $afterLateOtherSuccess->get_transaction_id(), 'A stale delayed success must not rebind the HPOS transaction identity.');
+
     $olderPayload = array_merge($firstPayload, array(
         'deliveryId' => 'hpos-delivery-stale-' . $orderId,
         'status' => 2,
@@ -169,6 +193,56 @@ try {
     );
     hposAssertSame('outdated', $olderResult, 'An older out-of-order event must be acknowledged without applying.');
     hposAssertSame(0, $olderEffects, 'An older event must not repeat or regress effects.');
+
+    $pendingTransactionId = 'hpos-pending-transaction-' . $orderId;
+    $pendingMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key($pendingTransactionId);
+    $afterLateOtherSuccess->set_transaction_id($pendingTransactionId);
+    $afterLateOtherSuccess->save();
+    $pendingOne = array_merge($firstPayload, array(
+        'deliveryId' => 'hpos-pending-1-' . $orderId,
+        'id' => $pendingTransactionId,
+        'status' => 0,
+    ));
+    $pendingOneBody = wp_json_encode($pendingOne, JSON_THROW_ON_ERROR);
+    try {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $afterLateOtherSuccess,
+            $pendingTransactionId,
+            $pendingOne,
+            $pendingOneBody,
+            static function (): void {
+                throw new RuntimeException('simulated first pending interruption');
+            }
+        );
+    } catch (RuntimeException $error) {
+        hposAssertSame('simulated first pending interruption', $error->getMessage(), 'The first interrupted HPOS claim must remain pending.');
+    }
+    $pendingTwo = array_merge($pendingOne, array(
+        'deliveryId' => 'hpos-pending-2-' . $orderId,
+        'eventVersion' => 2,
+    ));
+    $pendingTwoBody = wp_json_encode($pendingTwo, JSON_THROW_ON_ERROR);
+    try {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $afterLateOtherSuccess,
+            $pendingTransactionId,
+            $pendingTwo,
+            $pendingTwoBody,
+            static function (): void {
+                throw new RuntimeException('simulated second pending interruption');
+            }
+        );
+    } catch (RuntimeException $error) {
+        hposAssertSame('simulated second pending interruption', $error->getMessage(), 'The newest interrupted HPOS claim must remain pending.');
+    }
+
+    $afterPendingClaims = wc_get_order($orderId);
+    hposAssert($afterPendingClaims instanceof WC_Order, 'The order must reload after interrupted pending claims.');
+    $pendingState = $afterPendingClaims->get_meta($pendingMetaKey, true);
+    hposAssertSame('superseded', $pendingState['deliveries'][$pendingOne['deliveryId']]['phase'] ?? null, 'A newer HPOS event must proactively supersede the older pending claim.');
+    hposAssertSame('pending', $pendingState['deliveries'][$pendingTwo['deliveryId']]['phase'] ?? null, 'The newest interrupted HPOS event must remain recoverable.');
+    $afterPendingClaims->set_transaction_id($transactionId);
+    $afterPendingClaims->save();
 
     $finalOrder = wc_get_order($orderId);
     hposAssert($finalOrder instanceof WC_Order, 'The final order must reload.');

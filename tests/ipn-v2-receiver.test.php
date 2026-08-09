@@ -92,6 +92,12 @@ final class FakeIPNOrder
         return $this->transactionId;
     }
 
+    public function set_transaction_id(string $transactionId): void
+    {
+        $this->transactionId = $transactionId;
+        $this->trace[] = 'bind:' . $transactionId;
+    }
+
     public function payment_complete(string $transactionId): void
     {
         $this->transactionId = $transactionId;
@@ -412,6 +418,22 @@ ipnAssertSame('applied', $lateCancelAResult, 'A stale attempt remains acknowledg
 ipnAssertSame('refunded', $attemptOrder->status, 'The active payment transaction binding must survive terminal order status changes.');
 ipnAssertSame('transaction-b', $attemptOrder->transactionId, 'Terminal order status changes must retain the active payment-attempt identity.');
 
+$lateSuccessA = v2Payload('delivery-attempt-a-success', 5, 1);
+$lateSuccessA['id'] = 'transaction-a';
+$lateSuccessABody = json_encode($lateSuccessA, JSON_THROW_ON_ERROR);
+$lateSuccessAResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $attemptOrder,
+    'transaction-a',
+    $lateSuccessA,
+    $lateSuccessABody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-a');
+    }
+);
+ipnAssertSame('applied', $lateSuccessAResult, 'A delayed success for a stale attempt must be durably acknowledged.');
+ipnAssertSame('refunded', $attemptOrder->status, 'A delayed transaction-A success must not reopen a transaction-B-refunded order.');
+ipnAssertSame('transaction-b', $attemptOrder->transactionId, 'A delayed transaction-A success must not rebind the refunded order.');
+
 // The same active-attempt invariant applies across the retained v1 and canonical v2 paths.
 $mixedOrder = new FakeIPNOrder();
 $legacyPayment = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
@@ -446,6 +468,87 @@ ipnAssertSame('stale_attempt', $lateLegacyFailure, 'A signed v1 stale-attempt ef
 ipnAssertSame('processing', $mixedOrder->status, 'A v2 cancellation from another transaction must not regress a v1-paid order.');
 ipnAssertSame('transaction-v1-b', $mixedOrder->transactionId, 'Mixed-protocol handling must preserve the active paid transaction.');
 ipnAssertSame('refunded', $attemptOrder->status, 'A v1 failure from another transaction must not regress the v2 payment attempt.');
+
+$v1PaidV2LateSuccessOrder = new FakeIPNOrder();
+WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $v1PaidV2LateSuccessOrder,
+    'transaction-v1-b',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v1-b');
+    }
+);
+WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $v1PaidV2LateSuccessOrder,
+    'transaction-v1-b',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('refunded');
+    }
+);
+$v2LateSuccess = v2Payload('delivery-mixed-v2-late-success', 1, 1);
+$v2LateSuccess['id'] = 'transaction-v2-a';
+$v2LateSuccessBody = json_encode($v2LateSuccess, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $v1PaidV2LateSuccessOrder,
+    'transaction-v2-a',
+    $v2LateSuccess,
+    $v2LateSuccessBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v2-a');
+    }
+);
+ipnAssertSame('refunded', $v1PaidV2LateSuccessOrder->status, 'A v2 delayed success must not reopen an order refunded by its v1 payment attempt.');
+ipnAssertSame('transaction-v1-b', $v1PaidV2LateSuccessOrder->transactionId, 'A v2 delayed success must not replace the retained v1 payment identity.');
+
+$v2PaidV1LateSuccessOrder = new FakeIPNOrder();
+$v2Payment = v2Payload('delivery-mixed-v2-payment', 1, 1);
+$v2Payment['id'] = 'transaction-v2-b';
+$v2PaymentBody = json_encode($v2Payment, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $v2PaidV1LateSuccessOrder,
+    'transaction-v2-b',
+    $v2Payment,
+    $v2PaymentBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v2-b');
+    }
+);
+$v2Refund = v2Payload('delivery-mixed-v2-refund', 2, 3);
+$v2Refund['id'] = 'transaction-v2-b';
+$v2RefundBody = json_encode($v2Refund, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $v2PaidV1LateSuccessOrder,
+    'transaction-v2-b',
+    $v2Refund,
+    $v2RefundBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('refunded');
+    }
+);
+$v1LateSuccessResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $v2PaidV1LateSuccessOrder,
+    'transaction-v1-a',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v1-a');
+    }
+);
+ipnAssertSame('stale_attempt', $v1LateSuccessResult, 'A delayed v1 success for another transaction must be suppressed after a v2 refund.');
+ipnAssertSame('refunded', $v2PaidV1LateSuccessOrder->status, 'A v1 delayed success must not reopen an order refunded by its v2 payment attempt.');
+ipnAssertSame('transaction-v2-b', $v2PaidV1LateSuccessOrder->transactionId, 'A v1 delayed success must not replace the retained v2 payment identity.');
+
+$explicitReplacementOrder = new FakeIPNOrder();
+$explicitReplacementOrder->payment_complete('transaction-old');
+$explicitReplacementOrder->update_status('refunded');
+$explicitReplacementOrder->set_transaction_id('transaction-replacement');
+$explicitReplacementResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $explicitReplacementOrder,
+    'transaction-replacement',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-replacement');
+    }
+);
+ipnAssertSame('applied', $explicitReplacementResult, 'An explicitly rebound replacement payment attempt must remain processable.');
+ipnAssertSame('processing', $explicitReplacementOrder->status, 'An explicitly rebound replacement attempt may repay a refunded order.');
+ipnAssertSame('transaction-replacement', $explicitReplacementOrder->transactionId, 'Explicit replacement binding must remain authoritative.');
 
 // A crash-pending event that is superseded remains safely acknowledgeable on every retry.
 $pendingOrder = new FakeIPNOrder();
@@ -547,6 +650,45 @@ ipnAssertSame(
     'pending',
     $supersededRetentionState['deliveries']['delivery-superseded-105']['phase'] ?? null,
     'Retention must not discard the latest recoverable pending delivery.'
+);
+
+// Newer event claims proactively supersede older pending work without requiring an old-delivery retry.
+$noRetryRetentionOrder = new FakeIPNOrder();
+for ($version = 1; $version <= 105; $version++) {
+    $noRetryPayload = v2Payload('delivery-no-retry-' . $version, $version, 0);
+    $noRetryBody = json_encode($noRetryPayload, JSON_THROW_ON_ERROR);
+    try {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $noRetryRetentionOrder,
+            'transaction-no-retry-retention',
+            $noRetryPayload,
+            $noRetryBody,
+            static function (): void {
+                throw new RuntimeException('simulated pending effect interruption');
+            }
+        );
+    } catch (RuntimeException $error) {
+        ipnAssertSame('simulated pending effect interruption', $error->getMessage(), 'Each interrupted newer event must preserve its recoverable claim.');
+    }
+}
+$noRetryRetentionState = $noRetryRetentionOrder->get_meta(
+    WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-no-retry-retention'),
+    true
+);
+$recoverableDeliveryIds = array();
+foreach ($noRetryRetentionState['deliveries'] as $retainedDeliveryId => $delivery) {
+    if (($delivery['phase'] ?? null) === 'pending') {
+        $recoverableDeliveryIds[] = $retainedDeliveryId;
+    }
+}
+ipnAssertTrue(
+    count($noRetryRetentionState['deliveries']) <= WC_Payment_Gateway_App_IPN_V2_Processor::MAX_RETAINED_DELIVERIES,
+    'Newer failed effects must not leave terminally superseded pending claims beyond the retention bound.'
+);
+ipnAssertSame(
+    array('delivery-no-retry-105'),
+    $recoverableDeliveryIds,
+    'Only the newest interrupted delivery may remain recoverable without retrying older deliveries.'
 );
 
 ipnAssertSame(
