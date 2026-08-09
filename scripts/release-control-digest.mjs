@@ -11,6 +11,10 @@ export const RELEASE_CONTROL_FILES = Object.freeze([
   "scripts/validate-release-policy.mjs",
   "scripts/prepare-release.php",
   "scripts/publish-release.mjs",
+  "tests/release-workflow.test.php",
+  "tests/release-policy.test.mjs",
+  "tests/release-workflow.test.mjs",
+  "tests/publish-release.test.mjs",
 ]);
 
 function sha256(body) {
@@ -57,4 +61,3 @@ export function calculateReleaseControlBundle(repositoryRoot) {
   }
   return calculateReleaseControlBundleFromContents(contents);
 }
-
