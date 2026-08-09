@@ -36,7 +36,7 @@ test("Woo PR validation is separate and cannot publish", () => {
 
 test("Woo PR validation fetches the pinned parent source", () => {
   assert.match(prWorkflow, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
-  assert.match(prWorkflow, /fetch-depth: 2/);
+  assert.match(prWorkflow, /fetch-depth: 0/);
 });
 
 test("Woo PR validation proves the checked-out source against authoritative HPOS", () => {
