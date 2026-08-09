@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -150,6 +150,32 @@ test("release policy rejects source retargeting, under-versioning, and malformed
 });
 const controlBundlePath = path.join(root, "scripts/release-control-digest.mjs");
 
+function discoverStaticReleaseControlInputs(entryPaths) {
+  const discovered = new Set(entryPaths);
+  const pending = [...entryPaths];
+  while (pending.length > 0) {
+    const relativePath = pending.shift();
+    const source = readFileSync(path.join(root, relativePath), "utf8");
+    const dependencies = [];
+    for (const match of source.matchAll(/path\.join\(root,\s*["']([^"']+)["']\)/g)) {
+      dependencies.push(match[1]);
+    }
+    for (const match of source.matchAll(/dirname\(__DIR__\)\s*\.\s*["']\/([^"']+)["']/g)) {
+      dependencies.push(match[1]);
+    }
+    for (const match of source.matchAll(/(?:from\s+|import\s*\()\s*["'](\.\.?\/[^"']+)["']/g)) {
+      dependencies.push(path.relative(root, path.resolve(path.dirname(path.join(root, relativePath)), match[1])));
+    }
+    for (const dependency of dependencies) {
+      if (!discovered.has(dependency)) {
+        discovered.add(dependency);
+        pending.push(dependency);
+      }
+    }
+  }
+  return [...discovered].sort();
+}
+
 test("release-control digest binds the exact publication controls and fails on a missing file", async (t) => {
   const { RELEASE_CONTROL_FILES, calculateReleaseControlBundle } = await import(pathToFileURL(controlBundlePath));
   assert.deepEqual(RELEASE_CONTROL_FILES, [
@@ -163,7 +189,22 @@ test("release-control digest binds the exact publication controls and fails on a
     "tests/release-policy.test.mjs",
     "tests/release-workflow.test.mjs",
     "tests/publish-release.test.mjs",
+    ".github/workflows/validate-release-controls.yml",
+    "README.md",
+    ".wp-env.json",
+    "tests/hpos-integration.php",
   ]);
+  const staticInputs = discoverStaticReleaseControlInputs([
+    "tests/release-workflow.test.php",
+    "tests/release-policy.test.mjs",
+    "tests/release-workflow.test.mjs",
+    "tests/publish-release.test.mjs",
+  ]);
+  assert.deepEqual(
+    staticInputs.filter((filePath) => !RELEASE_CONTROL_FILES.includes(filePath)),
+    [],
+    "Every statically read or imported repository input must be bound into the release-control digest",
+  );
   const first = calculateReleaseControlBundle(root);
   const second = calculateReleaseControlBundle(root);
   assert.deepEqual(second, first);

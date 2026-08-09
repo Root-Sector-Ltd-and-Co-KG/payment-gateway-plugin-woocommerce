@@ -15,6 +15,10 @@ export const RELEASE_CONTROL_FILES = Object.freeze([
   "tests/release-policy.test.mjs",
   "tests/release-workflow.test.mjs",
   "tests/publish-release.test.mjs",
+  ".github/workflows/validate-release-controls.yml",
+  "README.md",
+  ".wp-env.json",
+  "tests/hpos-integration.php",
 ]);
 
 function sha256(body) {
