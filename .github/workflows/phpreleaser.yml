@@ -1,67 +1,205 @@
----
-name: phpreleaser
-
-# Grant GITHUB_TOKEN the rights it needs
-permissions:
-  contents: write # gives access to create Releases via the REST API
-  issues: write # optional, if you want to comment on PRs/issues
-  pull-requests: write # optional, same
-  packages: write # optional, if you publish packages
+name: Validate and Release WooCommerce Plugin
 
 on:
   pull_request:
-  push:
-    tags:
-      - "**"
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "Exact reviewed plugin source commit to tag"
+        required: true
+        type: string
+      version:
+        description: "Exact x.y.z plugin version to publish"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: woo-plugin-release-${{ github.event_name }}-${{ inputs.version || github.ref }}
+  cancel-in-progress: false
+
+env:
+  SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
+  PLUGIN_RELEASE_VERSION: ${{ inputs.version || '' }}
+  RELEASE_POLICY_ID: woocommerce-plugin-release-v1
+  RELEASE_POLICY_REVISION: ${{ github.sha }}
 
 jobs:
-  phpreleaser:
+  validate:
+    name: Validate exact source, policy, and HPOS
     runs-on: ubuntu-latest
-    env:
-      PLUGIN_RELEASE_VERSION: ${{ github.ref_name }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: Checkout release controls
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          fetch-depth: 0
+          ref: ${{ github.sha }}
+          path: release-control
 
-      - name: Validate PHP syntax
+      - name: Checkout selected plugin source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          path: payment-gateway-plugin-woocommerce
+
+      - name: Verify selected source identity
+        working-directory: payment-gateway-plugin-woocommerce
+        run: |
+          if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::source_sha must be a full lowercase commit SHA."
+            exit 1
+          fi
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          if [[ "$CHECKED_OUT_SHA" != "$SOURCE_SHA" ]]; then
+            echo "::error::Selected source resolved to $CHECKED_OUT_SHA instead of $SOURCE_SHA."
+            exit 1
+          fi
+
+      - name: Validate selected plugin PHP regressions
+        working-directory: payment-gateway-plugin-woocommerce
         run: |
           find . -name '*.php' -print0 | xargs -0 -n1 php -l
           php tests/api-error-context.test.php
+          php tests/customer-risk-integration.test.php
+          php tests/customer-risk-error-context.test.php
           php tests/ipn-v2-receiver.test.php
-          php tests/release-workflow.test.php
 
-      - name: Prepare release metadata
-        if: startsWith(github.ref, 'refs/tags/')
-        run: php scripts/prepare-release.php "$PLUGIN_RELEASE_VERSION"
-
-      - name: Print Release Version
-        if: startsWith(github.ref, 'refs/tags/')
-        run: echo "Release version is $PLUGIN_RELEASE_VERSION"
-
-      - name: Create Subfolder
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Validate release-control regressions
         run: |
-          mkdir -p woocommerce-payment-gateway-app
-          find . -maxdepth 1 -type f \
-            -exec mv {} woocommerce-payment-gateway-app/ \;
-          find . -maxdepth 1 -type d ! -name woocommerce-payment-gateway-app ! -name . \
-            -exec mv {} woocommerce-payment-gateway-app/ \;
-          rm -rf woocommerce-payment-gateway-app/.git* woocommerce-payment-gateway-app/.github
+          php release-control/tests/release-workflow.test.php
+          node --test release-control/tests/release-policy.test.mjs release-control/tests/release-workflow.test.mjs
 
-      - name: Archive Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: thedoctor0/zip-release@0.7.6
-        with:
-          type: "zip"
-          filename: woocommerce-payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
-          exclusions: "woocommerce-payment-gateway-app/RELEASE.md woocommerce-payment-gateway-app/scripts/* woocommerce-payment-gateway-app/tests/* *.git* *.github*"
+      - name: Validate release policy and source
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          node release-control/scripts/validate-release-policy.mjs --repository payment-gateway-plugin-woocommerce --source-sha "$SOURCE_SHA" --version "$PLUGIN_RELEASE_VERSION" --changelog payment-gateway-plugin-woocommerce/README.md --changelog-heading "= $PLUGIN_RELEASE_VERSION =" --policy-id "$RELEASE_POLICY_ID" --policy-revision "$RELEASE_POLICY_REVISION" --output plugin-release-version-evidence.json
+          (cd payment-gateway-plugin-woocommerce && php scripts/prepare-release.php "$PLUGIN_RELEASE_VERSION")
 
-      - name: Upload Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: ncipollo/release-action@v1
+      - name: Set up Node.js for HPOS
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          artifacts: woocommerce-payment-gateway-app_v${{ env.PLUGIN_RELEASE_VERSION }}.zip
-          bodyFile: woocommerce-payment-gateway-app/RELEASE.md
-          token: ${{ secrets.GITHUB_TOKEN }}
+          node-version: 24
+          cache: npm
+          cache-dependency-path: payment-gateway-plugin-woocommerce/package-lock.json
+
+      - name: Install the locked WordPress environment
+        working-directory: payment-gateway-plugin-woocommerce
+        run: npm ci
+
+      - name: Start WordPress and WooCommerce
+        working-directory: payment-gateway-plugin-woocommerce
+        run: npm run wp-env -- start
+
+      - name: Enable authoritative HPOS storage
+        working-directory: payment-gateway-plugin-woocommerce
+        run: |
+          npm run wp-env -- run cli wp option update woocommerce_custom_orders_table_enabled yes
+          npm run wp-env -- run cli wp option update woocommerce_custom_orders_table_data_sync_enabled no
+
+      - name: Verify durable IPN v2 behavior through WooCommerce HPOS
+        working-directory: payment-gateway-plugin-woocommerce
+        run: npm run wp-env -- run cli wp eval-file wp-content/plugins/payment-gateway-plugin-woocommerce/tests/hpos-integration.php
+
+      - name: Stop WordPress
+        if: always()
+        working-directory: payment-gateway-plugin-woocommerce
+        run: npm run wp-env -- stop
+
+  publish:
+    name: Publish immutable plugin release
+    if: github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPOSITORY: ${{ github.repository }}
+      VALIDATION_JOB_RESULT: ${{ needs.validate.result }}
+    steps:
+      - name: Checkout release controls
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: release-control
+
+      - name: Checkout selected plugin source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          path: payment-gateway-plugin-woocommerce
+
+      - name: Validate release policy and source
+        run: |
+          node release-control/scripts/validate-release-policy.mjs --repository payment-gateway-plugin-woocommerce --source-sha "$SOURCE_SHA" --version "$PLUGIN_RELEASE_VERSION" --changelog payment-gateway-plugin-woocommerce/README.md --changelog-heading "= $PLUGIN_RELEASE_VERSION =" --policy-id "$RELEASE_POLICY_ID" --policy-revision "$RELEASE_POLICY_REVISION" --output plugin-release-validation.json
+
+      - name: Build versioned archive and checksum
+        env:
+          ARTIFACT_NAME: woocommerce-payment-gateway-app_v${{ inputs.version }}.zip
+        run: |
+          PACKAGE_DIR="dist/woocommerce-payment-gateway-app"
+          mkdir -p "$PACKAGE_DIR"
+          git -C payment-gateway-plugin-woocommerce archive "$SOURCE_SHA" | tar -x -C "$PACKAGE_DIR"
+          (cd "$PACKAGE_DIR" && php scripts/prepare-release.php "$PLUGIN_RELEASE_VERSION")
+          cp "$PACKAGE_DIR/RELEASE.md" release-notes.md
+          rm -rf "$PACKAGE_DIR/.github" "$PACKAGE_DIR/scripts" "$PACKAGE_DIR/tests" "$PACKAGE_DIR/RELEASE.md"
+          (
+            cd dist
+            zip -qr "../$ARTIFACT_NAME" woocommerce-payment-gateway-app
+          )
+          sha256sum "$ARTIFACT_NAME" > "$ARTIFACT_NAME.sha256"
+
+          ARTIFACT_SHA256="$(cut -d ' ' -f1 "$ARTIFACT_NAME.sha256")"
+          jq --arg artifactName "$ARTIFACT_NAME" --arg artifactSha256 "$ARTIFACT_SHA256" --arg checksumAssetName "$ARTIFACT_NAME.sha256" --arg validationJobResult "$VALIDATION_JOB_RESULT" --arg workflowRunUrl "https://github.com/${REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" '. + {
+              artifactName: $artifactName,
+              artifactSha256: $artifactSha256,
+              checksumAssetName: $checksumAssetName,
+              validationJobResult: $validationJobResult,
+              workflowRunUrl: $workflowRunUrl
+            }' plugin-release-validation.json > plugin-release-validation.tmp
+          mv plugin-release-validation.tmp plugin-release-validation.json
+
+      - name: Refuse an existing release or replacement asset
+        run: |
+          set +e
+          gh release view "$PLUGIN_RELEASE_VERSION" --repo "$REPOSITORY" >/dev/null 2>release-lookup.err
+          RELEASE_STATUS=$?
+          set -e
+          if [[ "$RELEASE_STATUS" -eq 0 ]]; then
+            echo "::error::Release $PLUGIN_RELEASE_VERSION already exists; assets are immutable."
+            exit 1
+          fi
+          if ! grep -Eqi 'not found|HTTP 404|release not found' release-lookup.err; then
+            cat release-lookup.err >&2
+            echo "::error::Could not prove that release $PLUGIN_RELEASE_VERSION is absent."
+            exit 1
+          fi
+
+      - name: Create immutable tag
+        working-directory: payment-gateway-plugin-woocommerce
+        run: |
+          REMOTE_REFS="$(git ls-remote --tags origin "refs/tags/$PLUGIN_RELEASE_VERSION" "refs/tags/$PLUGIN_RELEASE_VERSION^{}")"
+          if [[ -n "$REMOTE_REFS" ]]; then
+            TAG_TARGET="$(printf '%s\n' "$REMOTE_REFS" | awk '/\^\{\}$/ { print $1; found=1 } END { if (!found) print first } NR == 1 { first=$1 }')"
+            if [[ "$TAG_TARGET" != "$SOURCE_SHA" ]]; then
+              echo "::error::Existing tag $PLUGIN_RELEASE_VERSION targets $TAG_TARGET instead of $SOURCE_SHA."
+              exit 1
+            fi
+            echo "Reusing exact immutable tag $PLUGIN_RELEASE_VERSION after successful validation."
+          else
+            git tag "$PLUGIN_RELEASE_VERSION" "$SOURCE_SHA"
+            git push origin "refs/tags/$PLUGIN_RELEASE_VERSION"
+          fi
+
+      - name: Create immutable GitHub release
+        env:
+          ARTIFACT_NAME: woocommerce-payment-gateway-app_v${{ inputs.version }}.zip
+        run: |
+          gh release create "$PLUGIN_RELEASE_VERSION" "$ARTIFACT_NAME#$ARTIFACT_NAME" "$ARTIFACT_NAME.sha256#$ARTIFACT_NAME.sha256" "plugin-release-validation.json#plugin-release-validation.json" --repo "$REPOSITORY" --verify-tag --title "WooCommerce Payment Gateway App $PLUGIN_RELEASE_VERSION" --notes-file release-notes.md
