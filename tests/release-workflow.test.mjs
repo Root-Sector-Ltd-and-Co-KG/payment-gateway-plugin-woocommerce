@@ -74,6 +74,7 @@ test("exact-source validation and genuine HPOS succeed before write-scoped publi
   assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40}/);
   assert.match(workflow, /actions\/download-artifact@[0-9a-f]{40}/);
   assert.match(workflow, /php "\$GITHUB_WORKSPACE\/release-control\/\$PREPARE_SCRIPT" "\$PLUGIN_RELEASE_VERSION"/);
+  assert.match(workflow, /git -C payment-gateway-plugin-woocommerce archive "\$SOURCE_SHA" \| tar -x -C "\$PACKAGE_DIR"/);
   assert.doesNotMatch(workflow, /\(cd "\$PACKAGE_DIR" && php "\$PREPARE_SCRIPT"/);
 
   const publish = workflow.slice(workflow.indexOf("  publish:"));
