@@ -38,7 +38,38 @@ try {
     $order->set_currency('EUR');
     $order->set_total('12.34');
     $order->set_status('pending');
+    $order->update_meta_data(WC_Payment_Gateway_App_Checkout_Attempt::META_KEY, 'hpos-session-attempt-b-' . $orderId);
     $order->save();
+
+    $staleBeforePaymentTransactionId = 'hpos-before-payment-attempt-a-' . $orderId;
+    $staleBeforePaymentPayload = array(
+        'schemaVersion' => 2,
+        'deliveryId' => 'hpos-before-payment-stale-' . $orderId,
+        'eventVersion' => 1,
+        'occurredAt' => '2026-08-08T11:59:00Z',
+        'id' => $staleBeforePaymentTransactionId,
+        'externalReference' => (string) $orderId,
+        'sessionPublicId' => 'hpos-session-attempt-a-' . $orderId,
+        'status' => 2,
+    );
+    $staleBeforePaymentBody = wp_json_encode($staleBeforePaymentPayload, JSON_THROW_ON_ERROR);
+    $staleBeforePaymentEffects = 0;
+    $staleBeforePaymentResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $order,
+        $staleBeforePaymentTransactionId,
+        $staleBeforePaymentPayload,
+        $staleBeforePaymentBody,
+        static function (WC_Order $effectOrder) use (&$staleBeforePaymentEffects): void {
+            $staleBeforePaymentEffects++;
+            $effectOrder->update_status('failed');
+        }
+    );
+    hposAssertSame('applied', $staleBeforePaymentResult, 'A stale attempt must be durably acknowledged before any transaction ID is bound.');
+    hposAssertSame(0, $staleBeforePaymentEffects, 'A mismatched signed attempt must not affect an unpaid HPOS order.');
+    $order = wc_get_order($orderId);
+    hposAssert($order instanceof WC_Order, 'The unpaid HPOS order must reload after suppressing a stale attempt.');
+    hposAssertSame('pending', $order->get_status(), 'A stale failure must not regress the current unpaid attempt.');
+    hposAssertSame('', $order->get_transaction_id(), 'Suppressing a stale pre-payment attempt must not bind a transaction ID.');
 
     $firstPayload = array(
         'schemaVersion' => 2,
@@ -47,6 +78,7 @@ try {
         'occurredAt' => '2026-08-08T12:00:00Z',
         'id' => $transactionId,
         'externalReference' => (string) $orderId,
+        'sessionPublicId' => 'hpos-session-attempt-b-' . $orderId,
         'status' => 1,
     );
     $firstBody = wp_json_encode($firstPayload, JSON_THROW_ON_ERROR);

@@ -60,6 +60,16 @@ function v2Payload(string $deliveryId, int $eventVersion, $status = 1): array
     );
 }
 
+function attemptPayload(string $attemptId, int $status): array
+{
+    return array(
+        'id' => 'transaction-' . $status,
+        'externalReference' => '42',
+        'sessionPublicId' => $attemptId,
+        'status' => $status,
+    );
+}
+
 final class FakeIPNOrder
 {
     public array $trace = array();
@@ -208,6 +218,73 @@ $invalidDate['occurredAt'] = '2026-02-30T18:30:00Z';
 $invalidDateBody = json_encode($invalidDate, JSON_THROW_ON_ERROR);
 $invalidDateResult = WC_Payment_Gateway_App_IPN_Request::verify($invalidDateBody, signedHeaders($invalidDateBody, $secret, $now, '2', 'delivery-date'), $secret, $now);
 ipnAssertSame(false, $invalidDateResult['ok'], 'An impossible occurredAt date must be rejected.');
+
+$invalidAttemptPayload = v2Payload('delivery-attempt-invalid', 2);
+$invalidAttemptPayload['sessionPublicId'] = str_repeat('a', 129);
+$invalidAttemptBody = json_encode($invalidAttemptPayload, JSON_THROW_ON_ERROR);
+$invalidAttemptResult = WC_Payment_Gateway_App_IPN_Request::verify(
+    $invalidAttemptBody,
+    signedHeaders($invalidAttemptBody, $secret, $now, '2', 'delivery-attempt-invalid'),
+    $secret,
+    $now
+);
+ipnAssertSame(false, $invalidAttemptResult['ok'], 'An oversized signed checkout-attempt identity must be rejected.');
+ipnAssertSame('invalid_session_public_id', $invalidAttemptResult['code'], 'Attempt-identity validation must use a fixed error code.');
+
+$invalidV1AttemptBody = json_encode(array(
+    'id' => 'transaction-invalid-v1-attempt',
+    'externalReference' => '42',
+    'sessionPublicId' => array('not' => 'scalar'),
+    'status' => 1,
+), JSON_THROW_ON_ERROR);
+$invalidV1AttemptResult = WC_Payment_Gateway_App_IPN_Request::verify(
+    $invalidV1AttemptBody,
+    signedHeaders($invalidV1AttemptBody, $secret, $now),
+    $secret,
+    $now
+);
+ipnAssertSame(false, $invalidV1AttemptResult['ok'], 'A malformed signed v1 checkout-attempt identity must also be rejected.');
+ipnAssertSame('invalid_session_public_id', $invalidV1AttemptResult['code'], 'V1 and v2 attempt validation must use the same fixed error code.');
+
+$currentAttemptOrder = new FakeIPNOrder();
+$currentAttemptOrder->update_meta_data(WC_Payment_Gateway_App_Checkout_Attempt::META_KEY, 'session-attempt-b');
+foreach (array(0, -2, 2, 1) as $staleStatus) {
+    $effectCount = 0;
+    $result = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+        $currentAttemptOrder,
+        'transaction-attempt-a-' . $staleStatus,
+        attemptPayload('session-attempt-a', $staleStatus),
+        static function () use (&$effectCount): void {
+            $effectCount++;
+        }
+    );
+    ipnAssertSame('stale_attempt', $result, 'A signed pending/cancel/fail/success event from attempt A must be acknowledged without changing attempt B.');
+    ipnAssertSame(0, $effectCount, 'A mismatched signed attempt identity must suppress every order effect.');
+}
+
+$currentAttemptEffectCount = 0;
+$currentAttemptResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $currentAttemptOrder,
+    'transaction-attempt-b',
+    attemptPayload('session-attempt-b', 1),
+    static function () use (&$currentAttemptEffectCount): void {
+        $currentAttemptEffectCount++;
+    }
+);
+ipnAssertSame('applied', $currentAttemptResult, 'A signed event for the persisted current attempt must still apply.');
+ipnAssertSame(1, $currentAttemptEffectCount, 'The current attempt must apply exactly one effect.');
+
+$omittedAttemptEffectCount = 0;
+$omittedAttemptResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $currentAttemptOrder,
+    'transaction-legacy',
+    array('id' => 'transaction-legacy', 'externalReference' => '42', 'status' => 0),
+    static function () use (&$omittedAttemptEffectCount): void {
+        $omittedAttemptEffectCount++;
+    }
+);
+ipnAssertSame('applied', $omittedAttemptResult, 'An older signed sender that omits the additive field must remain compatible.');
+ipnAssertSame(1, $omittedAttemptEffectCount, 'The omitted-field compatibility path must retain existing behavior.');
 
 // Invalid payment statuses must be rejected before they can reserve durable event state.
 $statusIntegrityOrder = new FakeIPNOrder();

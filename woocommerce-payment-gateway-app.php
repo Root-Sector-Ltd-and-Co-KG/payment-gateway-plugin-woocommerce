@@ -50,6 +50,12 @@ final class WC_Payment_Gateway_App_IPN_Request
         if (json_last_error() !== JSON_ERROR_NONE || !is_array($payload)) {
             return self::failure('invalid_json');
         }
+        if (
+            array_key_exists('sessionPublicId', $payload)
+            && !WC_Payment_Gateway_App_Checkout_Attempt::valid_identifier($payload['sessionPublicId'])
+        ) {
+            return self::failure('invalid_session_public_id');
+        }
 
         $version_header = isset($headers['version']) ? trim((string) $headers['version']) : '';
         if ($version_header === '') {
@@ -174,6 +180,49 @@ final class WC_Payment_Gateway_App_IPN_Request
     }
 }
 
+final class WC_Payment_Gateway_App_Checkout_Attempt
+{
+    const META_KEY = '_payment_gateway_app_session_public_id';
+    const MAX_IDENTIFIER_LENGTH = 128;
+
+    public static function valid_identifier($value)
+    {
+        return is_string($value)
+            && $value !== ''
+            && strlen($value) <= self::MAX_IDENTIFIER_LENGTH
+            && preg_match('/\A[A-Za-z0-9._:-]+\z/', $value) === 1;
+    }
+
+    public static function persist_from_checkout_response($order, array $response_body)
+    {
+        if (!array_key_exists('sessionPublicId', $response_body)) {
+            return 'omitted';
+        }
+        if (!self::valid_identifier($response_body['sessionPublicId'])) {
+            return 'invalid';
+        }
+        $order->update_meta_data(self::META_KEY, $response_body['sessionPublicId']);
+        $order->save();
+        return 'persisted';
+    }
+
+    public static function matches_signed_event($order, array $payload)
+    {
+        if (!array_key_exists('sessionPublicId', $payload)) {
+            return true;
+        }
+        $event_attempt = $payload['sessionPublicId'];
+        if (!self::valid_identifier($event_attempt)) {
+            return false;
+        }
+        $current_attempt = $order->get_meta(self::META_KEY, true);
+        if (!self::valid_identifier($current_attempt)) {
+            return true;
+        }
+        return hash_equals((string) $current_attempt, (string) $event_attempt);
+    }
+}
+
 final class WC_Payment_Gateway_App_IPN_V2_Processor
 {
     const STATE_FORMAT_VERSION = 1;
@@ -288,6 +337,7 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
         WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
             $order,
             $transaction_id,
+            $payload,
             static function ($effect_order) use ($apply_effect, $payload) {
                 $apply_effect($effect_order, $payload);
             }
@@ -346,6 +396,7 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
         $effect_semantics = array(
             'id' => isset($payload['id']) && is_scalar($payload['id']) ? (string) $payload['id'] : null,
             'externalReference' => isset($payload['externalReference']) && is_scalar($payload['externalReference']) ? (string) $payload['externalReference'] : null,
+            'sessionPublicId' => isset($payload['sessionPublicId']) && is_scalar($payload['sessionPublicId']) ? (string) $payload['sessionPublicId'] : null,
             'status' => array_key_exists('status', $payload) ? $payload['status'] : null,
         );
         return hash('sha256', json_encode(
@@ -395,8 +446,21 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
 
 final class WC_Payment_Gateway_App_IPN_Order_Attempt
 {
-    public static function apply($order, $transaction_id, callable $apply_effect)
+    public static function apply($order, $transaction_id, $payload_or_effect, $maybe_apply_effect = null)
     {
+        if (is_callable($payload_or_effect) && $maybe_apply_effect === null) {
+            $payload = array();
+            $apply_effect = $payload_or_effect;
+        } else {
+            $payload = is_array($payload_or_effect) ? $payload_or_effect : array();
+            $apply_effect = $maybe_apply_effect;
+        }
+        if (!is_callable($apply_effect)) {
+            throw new InvalidArgumentException('IPN effect callback is required.');
+        }
+        if (!WC_Payment_Gateway_App_Checkout_Attempt::matches_signed_event($order, $payload)) {
+            return 'stale_attempt';
+        }
         $active_transaction_id = trim((string) $order->get_transaction_id());
         if (
             $active_transaction_id !== ''
@@ -988,6 +1052,14 @@ function init_woocommerce_payment_gateway_app()
             }
 
             if (isset($response_body['paymentUrl'])) {
+                $attempt_persistence = WC_Payment_Gateway_App_Checkout_Attempt::persist_from_checkout_response($order, $response_body);
+                if ($attempt_persistence === 'invalid') {
+                    wc_add_notice(__('Payment session creation failed due to an invalid gateway response.', 'woo-payment-gateway-app'), 'error');
+                    return array(
+                        'result' => 'failure',
+                        'redirect' => $cancelurl
+                    );
+                }
                 return array(
                     'result' => 'success',
                     'redirect' => $response_body['paymentUrl']
@@ -1106,6 +1178,7 @@ function init_woocommerce_payment_gateway_app()
                     $processing_result = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
                         $order,
                         $transaction_id,
+                        $parsed_request,
                         function ($locked_order) use ($parsed_request, $dispute_status, $transaction_id) {
                             $this->apply_webhook_effect($locked_order, $parsed_request, $dispute_status, $transaction_id, false);
                         }

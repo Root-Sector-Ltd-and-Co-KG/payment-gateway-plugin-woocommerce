@@ -36,10 +36,14 @@ class RiskTestLogger
 class RiskTestOrder
 {
     public array $statuses = array();
+    public array $meta = array();
+    public int $saves = 0;
     public function get_billing_email(): string { return 'buyer@example.test'; }
     public function get_cancel_order_url(): string { return 'https://shop.example.test/cancel'; }
     public function get_total(): float { return 12.34; }
     public function update_status($status, $note = ''): void { $this->statuses[] = array($status, $note); }
+    public function update_meta_data($key, $value): void { $this->meta[(string)$key] = $value; }
+    public function save(): void { $this->saves++; }
 }
 
 function add_action(): void {}
@@ -121,8 +125,28 @@ integrationAssert(str_contains($encodedLogs, 'allowed_provider_types'), 'Debug-o
 integrationAssert(!str_contains($encodedLogs, 'buyer@example.test'), 'Debug logs must exclude PII and backend messages.');
 integrationAssert(!str_contains($encodedLogs, 'secret-api-key'), 'Debug logs must exclude credentials and raw request data.');
 
-list($successResult, $successOrder) = integrationRun(array('paymentUrl' => 'https://pay.example.test/session'), 200, false);
+list($successResult, $successOrder) = integrationRun(array(
+    'paymentUrl' => 'https://pay.example.test/session',
+    'sessionPublicId' => 'session-public-attempt-b',
+), 200, false);
 integrationAssert($successResult === array('result' => 'success', 'redirect' => 'https://pay.example.test/session'), 'Normal successful checkout responses must remain unchanged.');
 integrationAssert($successOrder->statuses === array(), 'Successful checkout must not cancel the order.');
+integrationAssert(
+    ($successOrder->meta[WC_Payment_Gateway_App_Checkout_Attempt::META_KEY] ?? null) === 'session-public-attempt-b',
+    'The signed checkout-attempt identity must be persisted before redirecting.'
+);
+integrationAssert($successOrder->saves === 1, 'Persisting the checkout-attempt identity must durably save the order once.');
+
+list($legacySuccessResult, $legacySuccessOrder) = integrationRun(array('paymentUrl' => 'https://pay.example.test/legacy'), 200, false);
+integrationAssert($legacySuccessResult['result'] === 'success', 'A gateway response that omits the additive attempt identity must remain compatible.');
+integrationAssert($legacySuccessOrder->meta === array(), 'An omitted attempt identity must not persist an ambiguous value.');
+
+list($invalidAttemptResult, $invalidAttemptOrder, $invalidAttemptNotices) = integrationRun(array(
+    'paymentUrl' => 'https://pay.example.test/invalid',
+    'sessionPublicId' => 'invalid attempt identity',
+), 200, false);
+integrationAssert($invalidAttemptResult['result'] === 'failure', 'A malformed nonempty checkout-attempt identity must fail closed.');
+integrationAssert($invalidAttemptOrder->meta === array(), 'A malformed checkout-attempt identity must never be persisted.');
+integrationAssert(str_contains($invalidAttemptNotices[0][1], 'invalid gateway response'), 'Malformed attempt identity must expose only fixed safe guidance.');
 
 echo "WooCommerce customer-risk integration: PASS\n";
