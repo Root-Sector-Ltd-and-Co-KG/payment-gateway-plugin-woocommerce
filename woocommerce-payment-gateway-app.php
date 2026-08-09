@@ -396,9 +396,11 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
         $effect_semantics = array(
             'id' => isset($payload['id']) && is_scalar($payload['id']) ? (string) $payload['id'] : null,
             'externalReference' => isset($payload['externalReference']) && is_scalar($payload['externalReference']) ? (string) $payload['externalReference'] : null,
-            'sessionPublicId' => isset($payload['sessionPublicId']) && is_scalar($payload['sessionPublicId']) ? (string) $payload['sessionPublicId'] : null,
-            'status' => array_key_exists('status', $payload) ? $payload['status'] : null,
         );
+        if (array_key_exists('sessionPublicId', $payload)) {
+            $effect_semantics['sessionPublicId'] = (string) $payload['sessionPublicId'];
+        }
+        $effect_semantics['status'] = array_key_exists('status', $payload) ? $payload['status'] : null;
         return hash('sha256', json_encode(
             $effect_semantics,
             JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR

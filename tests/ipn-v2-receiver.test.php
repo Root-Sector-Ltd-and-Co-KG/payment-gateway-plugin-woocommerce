@@ -60,6 +60,18 @@ function v2Payload(string $deliveryId, int $eventVersion, $status = 1): array
     );
 }
 
+function preAttemptIdentityEffectHash(array $payload): string
+{
+    return hash('sha256', json_encode(
+        array(
+            'id' => isset($payload['id']) && is_scalar($payload['id']) ? (string) $payload['id'] : null,
+            'externalReference' => isset($payload['externalReference']) && is_scalar($payload['externalReference']) ? (string) $payload['externalReference'] : null,
+            'status' => array_key_exists('status', $payload) ? $payload['status'] : null,
+        ),
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR
+    ));
+}
+
 function attemptPayload(string $attemptId, int $status): array
 {
     return array(
@@ -692,6 +704,73 @@ $contradictoryReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::proce
 );
 ipnAssertSame('conflict', $contradictoryReplacementResult, 'A different delivery ID must not redefine the effect semantics of a transaction event version.');
 ipnAssertSame(0, $contradictoryReplacementEffects, 'A contradictory replacement must fail before running an effect.');
+
+// Persisted semantic identities written before sessionPublicId existed must remain
+// byte-for-byte compatible when an upgraded sender still omits the optional field.
+$preAttemptPendingOrder = new FakeIPNOrder();
+$preAttemptPendingPayload = v2Payload('delivery-pre-attempt-pending-original', 1, 0);
+$preAttemptPendingBody = json_encode($preAttemptPendingPayload, JSON_THROW_ON_ERROR);
+$preAttemptMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123');
+$preAttemptPendingOrder->update_meta_data($preAttemptMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $preAttemptPendingPayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $preAttemptPendingBody),
+            'phase' => 'pending',
+        ),
+    ),
+    'eventIdentities' => array('1' => preAttemptIdentityEffectHash($preAttemptPendingPayload)),
+));
+$preAttemptPendingRetry = array_merge($preAttemptPendingPayload, array(
+    'deliveryId' => 'delivery-pre-attempt-pending-retry',
+    'occurredAt' => '2026-07-26T18:31:30Z',
+));
+$preAttemptPendingRetryBody = json_encode($preAttemptPendingRetry, JSON_THROW_ON_ERROR);
+$preAttemptPendingEffects = 0;
+$preAttemptPendingResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $preAttemptPendingOrder,
+    'transaction-123',
+    $preAttemptPendingRetry,
+    $preAttemptPendingRetryBody,
+    static function () use (&$preAttemptPendingEffects): void {
+        $preAttemptPendingEffects++;
+    }
+);
+ipnAssertSame('applied', $preAttemptPendingResult, 'An omitted-field retry must recover pre-upgrade pending semantic state.');
+ipnAssertSame(1, $preAttemptPendingEffects, 'Pre-upgrade pending recovery must apply its effect exactly once.');
+
+$preAttemptAppliedOrder = new FakeIPNOrder();
+$preAttemptAppliedPayload = v2Payload('delivery-pre-attempt-applied-original', 1, 1);
+$preAttemptAppliedBody = json_encode($preAttemptAppliedPayload, JSON_THROW_ON_ERROR);
+$preAttemptAppliedOrder->update_meta_data($preAttemptMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $preAttemptAppliedPayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $preAttemptAppliedBody),
+            'phase' => 'applied',
+        ),
+    ),
+    'eventIdentities' => array('1' => preAttemptIdentityEffectHash($preAttemptAppliedPayload)),
+));
+$preAttemptAppliedRetry = array_merge($preAttemptAppliedPayload, array(
+    'deliveryId' => 'delivery-pre-attempt-applied-retry',
+    'occurredAt' => '2026-07-26T18:31:45Z',
+));
+$preAttemptAppliedRetryBody = json_encode($preAttemptAppliedRetry, JSON_THROW_ON_ERROR);
+$preAttemptAppliedResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $preAttemptAppliedOrder,
+    'transaction-123',
+    $preAttemptAppliedRetry,
+    $preAttemptAppliedRetryBody,
+    static function (): void {
+        throw new RuntimeException('A pre-upgrade acknowledgement-loss retry must not repeat the effect.');
+    }
+);
+ipnAssertSame('duplicate', $preAttemptAppliedResult, 'An omitted-field retry must dedupe pre-upgrade applied semantic state.');
 
 $legacyPendingOrder = new FakeIPNOrder();
 $legacyPendingPayload = v2Payload('delivery-legacy-pending-original', 1, 0);
