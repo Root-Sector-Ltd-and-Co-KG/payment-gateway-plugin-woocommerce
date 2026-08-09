@@ -3,7 +3,9 @@
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+import { calculateReleaseControlBundle } from "./release-control-digest.mjs";
 
 const conventionalHeader =
   /^(build|chore|ci|docs|feat|fix|perf|refactor|revert|style|test)(\([^)\r\n]+\))?(!)?: .+/;
@@ -258,6 +260,9 @@ function runCli(argv) {
     prepareScript: trustedRelease.prepareScript,
     releaseNotesFile: trustedRelease.releaseNotesFile,
   };
+  evidence.controlBundle = calculateReleaseControlBundle(
+    fileURLToPath(new URL("..", import.meta.url)),
+  );
   fs.writeFileSync(args.output, `${JSON.stringify(evidence, null, 2)}\n`, {
     flag: "wx",
   });
