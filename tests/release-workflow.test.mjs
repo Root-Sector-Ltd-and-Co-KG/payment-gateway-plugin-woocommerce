@@ -34,6 +34,25 @@ test("Woo PR validation is separate and cannot publish", () => {
   assert.match(prWorkflow, /node --test tests\/release-policy\.test\.mjs tests\/release-workflow\.test\.mjs tests\/publish-release\.test\.mjs/);
 });
 
+test("Woo PR validation proves the checked-out source against authoritative HPOS", () => {
+  const checkout = prWorkflow.indexOf("Checkout pull request source");
+  const setupNode = prWorkflow.indexOf("Set up Node.js for HPOS");
+  const install = prWorkflow.indexOf("npm ci");
+  const start = prWorkflow.indexOf("npm run wp-env -- start");
+  const enable = prWorkflow.indexOf("woocommerce_custom_orders_table_enabled yes");
+  const disableSync = prWorkflow.indexOf("woocommerce_custom_orders_table_data_sync_enabled no");
+  const integration = prWorkflow.indexOf("wp eval-file wp-content/plugins/payment-gateway-plugin-woocommerce/tests/hpos-integration.php");
+  const stop = prWorkflow.indexOf("npm run wp-env -- stop");
+
+  assert.ok(checkout >= 0 && setupNode > checkout && install > setupNode && start > install);
+  assert.ok(enable > start && disableSync > enable && integration > disableSync && stop > integration);
+  assert.match(prWorkflow, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/);
+  assert.match(prWorkflow, /actions\/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e\s+#\s+v6\.4\.0/);
+  assert.match(prWorkflow, /find \. -name '\*\.php' -print0 \| xargs -0 -n1 php -l/);
+  assert.match(prWorkflow, /if: always\(\)[\s\S]*?npm run wp-env -- stop/);
+  assert.equal((prWorkflow.match(/uses: actions\/checkout@/g) ?? []).length, 1, "HPOS must use the same checkout as PR validation");
+});
+
 test("every action in Woo release-control workflows is pinned to a reviewed commit", () => {
   const actionLines = `${workflow}\n${prWorkflow}`.split("\n").filter((line) => /\buses:/.test(line));
   assert.ok(actionLines.length > 0);
