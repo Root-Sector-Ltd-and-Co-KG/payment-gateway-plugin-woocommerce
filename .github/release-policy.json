@@ -8,7 +8,7 @@
   },
   "releases": {
     "1.2.0": {
-      "sourceRevision": "fba8a50feb4e61bbb60937d2dcd1186970496969",
+      "sourceRevision": "23708a9ae8411ab29c62b5500b9243b3666334a2",
       "artifactName": "woocommerce-payment-gateway-app_v1.2.0.zip",
       "archiveRoot": "woocommerce-payment-gateway-app",
       "prepareScript": "scripts/prepare-release.php",

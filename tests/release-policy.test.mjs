@@ -8,7 +8,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const policyPath = path.join(root, "scripts/validate-release-policy.mjs");
-const finalReceiverRevision = "fba8a50feb4e61bbb60937d2dcd1186970496969";
+const finalReceiverRevision = "23708a9ae8411ab29c62b5500b9243b3666334a2";
 
 test("release policy implementation is repository-local", () => {
   assert.ok(existsSync(policyPath), "scripts/validate-release-policy.mjs must exist");
