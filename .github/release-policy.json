@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "defaultBranch": "main",
+  "workflowPath": ".github/workflows/phpreleaser.yml",
+  "policy": {
+    "id": "woocommerce-plugin-release-v1",
+    "path": "scripts/validate-release-policy.mjs"
+  },
+  "releases": {
+    "1.2.0": {
+      "sourceRevision": "0dc997be6b8e39d391cb542f0ac6dd5377bc7d0f",
+      "artifactName": "woocommerce-payment-gateway-app_v1.2.0.zip",
+      "archiveRoot": "woocommerce-payment-gateway-app",
+      "prepareScript": "scripts/prepare-release.php",
+      "changelogFile": "README.md",
+      "changelogHeading": "= 1.2.0 =",
+      "releaseNotesFile": "RELEASE.md"
+    }
+  }
+}

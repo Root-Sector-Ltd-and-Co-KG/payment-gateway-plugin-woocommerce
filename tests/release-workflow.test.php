@@ -38,7 +38,7 @@ try {
     );
     file_put_contents(
         $temporaryRoot . '/README.md',
-        "=== Plugin ===\nStable tag: dev\n\n== Changelog ==\n\n= 1.1.1 =\n\n- Fixed release packaging.\n\n= 1.1.0 =\n\n- Previous release.\n"
+        "=== Plugin ===\nStable tag: dev\n\n== Upgrade Notice ==\n\n= 1.1.1 =\n\n- Upgrade before the cutoff.\n\n== Changelog ==\n\n= 1.1.1 =\n\n- Fixed release packaging.\n\n= 1.1.0 =\n\n- Previous release.\n"
     );
 
     prepareRelease($temporaryRoot, '1.1.1');
@@ -51,6 +51,7 @@ try {
     releaseAssertContains('Stable tag: 1.1.1', $readme, 'The packaged README stable tag must contain the tag version.');
     releaseAssertContains('= 1.1.1 =', $releaseNotes, 'Release notes must include the matching changelog heading.');
     releaseAssertContains('- Fixed release packaging.', $releaseNotes, 'Release notes must include the matching changelog items.');
+    releaseAssertNotContains('- Upgrade before the cutoff.', $releaseNotes, 'Release notes must not use the duplicate Upgrade Notice heading.');
     releaseAssertNotContains('= 1.1.0 =', $releaseNotes, 'Release notes must stop before the previous version.');
 
     $invalidVersionRejected = false;
@@ -69,19 +70,36 @@ try {
     }
     releaseAssertSame(true, $missingChangelogRejected, 'A release without a matching changelog entry must be rejected.');
 
+    file_put_contents(
+        $temporaryRoot . '/README.md',
+        "=== Plugin ===\nStable tag: 1.1.1\n\n== Changelog ==\n\n= 1.1.1 =\n\n- First entry.\n\n= 1.1.1 =\n\n- Duplicate entry.\n"
+    );
+    $duplicateChangelogRejected = false;
+    try {
+        prepareRelease($temporaryRoot, '1.1.1');
+    } catch (RuntimeException $exception) {
+        $duplicateChangelogRejected = str_contains($exception->getMessage(), 'exactly one changelog entry');
+    }
+    releaseAssertSame(true, $duplicateChangelogRejected, 'A duplicate version entry inside Changelog must be rejected.');
+
     $workflow = file_get_contents(dirname(__DIR__) . '/.github/workflows/phpreleaser.yml');
     releaseAssertContains('workflow_dispatch:', $workflow, 'Publication must require a manual pre-tag dispatch.');
     releaseAssertContains('source_sha:', $workflow, 'Publication must select an exact reviewed source commit.');
     releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ inputs.version', $workflow, 'Publication must use the selected semantic version.');
+    releaseAssertContains('refs/heads/main', $workflow, 'Publication must execute from the protected default branch.');
+    releaseAssertContains('github.ref_protected', $workflow, 'Publication must require GitHub to identify the workflow ref as protected.');
+    releaseAssertContains('.github/release-policy.json', $workflow, 'Publication must use the trusted repository release manifest.');
     releaseAssertContains("permissions:\n  contents: read", $workflow, 'The workflow default must be read-only.');
     releaseAssertContains('needs: validate', $workflow, 'Publication must depend on successful validation.');
     releaseAssertContains("permissions:\n      contents: write", $workflow, 'Only publication may write repository contents.');
     releaseAssertContains('php tests/ipn-v2-receiver.test.php', $workflow, 'The workflow must verify the IPN v2 receiver contract before packaging.');
     releaseAssertNotContains('payment-gateway-release-orchestrator/', $workflow, 'A public plugin workflow must not import the private release orchestrator.');
     releaseAssertContains('scripts/validate-release-policy.mjs', $workflow, 'Publication must run the repository-local SemVer policy.');
-    releaseAssertContains('woocommerce-payment-gateway-app_v${{ inputs.version }}.zip', $workflow, 'The archive filename must include the selected version.');
+    releaseAssertContains('.releases[$version].artifactName', $workflow, 'The archive filename must come from the trusted release manifest.');
     releaseAssertContains('sha256sum', $workflow, 'Publication must create an exact SHA-256 checksum asset.');
-    releaseAssertContains('gh release create', $workflow, 'Publication must create a new immutable release.');
+    releaseAssertContains('scripts/publish-release.mjs', $workflow, 'Publication must verify a resumable draft before making the release visible.');
+    releaseAssertContains('persist-credentials: false', $workflow, 'Publication checkouts must not retain write credentials.');
+    releaseAssertContains('release-control/$PREPARE_SCRIPT', $workflow, 'Packaging must use the trusted control-tree packager.');
     releaseAssertNotContains('--clobber', $workflow, 'Publication must never replace a release asset.');
     releaseAssertContains('npm ci', $workflow, 'The release validation workflow must install its locked WordPress environment.');
     releaseAssertContains('npm run wp-env -- start', $workflow, 'The release validation workflow must start a genuine WordPress environment.');

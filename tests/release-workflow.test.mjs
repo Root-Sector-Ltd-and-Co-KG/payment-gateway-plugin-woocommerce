@@ -15,6 +15,11 @@ test("Woo release is manually dispatched for an exact source and version", () =>
   assert.match(workflow, /^permissions:\s*\n\s+contents: read$/m);
   assert.doesNotMatch(workflow, /issues: write|pull-requests: write|packages: write/);
   assert.doesNotMatch(workflow, /payment-gateway-release-orchestrator|workflow_call/);
+  assert.match(workflow, /refs\/heads\/main/);
+  assert.match(workflow, /github\.event\.repository\.default_branch/);
+  assert.match(workflow, /github\.ref_protected/);
+  assert.match(workflow, /WORKFLOW_REF_PROTECTED" != "true"/);
+  assert.match(workflow, /\.github\/release-policy\.json/);
 });
 
 test("every action in the Woo release workflow is pinned to a reviewed commit", () => {
@@ -35,19 +40,33 @@ test("exact-source validation and genuine HPOS succeed before write-scoped publi
   assert.match(workflow, /wp eval-file wp-content\/plugins\/payment-gateway-plugin-woocommerce\/tests\/hpos-integration\.php/);
   assert.match(workflow, /publish:\s*\n[\s\S]*?needs: validate[\s\S]*?permissions:\s*\n\s+contents: write/);
   assert.match(workflow, /needs\.validate\.result/);
+  assert.match(workflow, /actions\/upload-artifact@[0-9a-f]{40}/);
+  assert.match(workflow, /actions\/download-artifact@[0-9a-f]{40}/);
+  assert.match(workflow, /php "\$GITHUB_WORKSPACE\/release-control\/\$PREPARE_SCRIPT" "\$PLUGIN_RELEASE_VERSION"/);
+  assert.doesNotMatch(workflow, /\(cd "\$PACKAGE_DIR" && php "\$PREPARE_SCRIPT"/);
+
+  const publish = workflow.slice(workflow.indexOf("  publish:"));
+  assert.doesNotMatch(publish, /payment-gateway-plugin-woocommerce|prepare-release\.php|git archive/);
+  for (const checkout of workflow.matchAll(/uses: actions\/checkout@[\s\S]*?(?=\n\s*- name:|\n\s*$)/g)) {
+    assert.match(checkout[0], /persist-credentials: false/);
+  }
+  const tokenLines = workflow.split("\n").filter((line) => /GH_TOKEN:/.test(line));
+  assert.ok(tokenLines.length > 0);
+  assert.ok(tokenLines.every((line) => /^ {10}GH_TOKEN:/.test(line)), "GH_TOKEN must be scoped to an exact step");
 });
 
-test("publication validates policy before tagging and publishes non-replaceable checksum evidence", () => {
-  const policy = workflow.indexOf("Validate release policy and source");
-  const tag = workflow.indexOf("Create immutable tag");
-  const release = workflow.indexOf("Create immutable GitHub release");
-  assert.ok(policy >= 0 && tag > policy && release > tag);
+test("publication resumes a verified draft and publishes only after exact asset readback", () => {
+  const policy = workflow.indexOf("Validate trusted release manifest, policy, and source");
+  const bundle = workflow.indexOf("Transfer validated release bundle");
+  const publish = workflow.indexOf("  publish:");
+  assert.ok(policy >= 0 && bundle > policy && publish > bundle);
   assert.match(workflow, /scripts\/validate-release-policy\.mjs/);
   assert.match(workflow, /sha256sum/);
   assert.match(workflow, /artifactSha256/);
   assert.match(workflow, /checksumAssetName/);
   assert.match(workflow, /validationJobResult/);
-  assert.match(workflow, /gh release view/);
-  assert.match(workflow, /gh release create/);
+  assert.match(workflow, /publish-release\.mjs/);
+  assert.match(workflow, /draft/i);
+  assert.match(workflow, /release-bundle/);
   assert.doesNotMatch(workflow, /allowUpdates|--clobber|release-action|zip-release/);
 });

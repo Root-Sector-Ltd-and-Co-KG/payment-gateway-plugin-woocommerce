@@ -2,6 +2,7 @@
 
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const conventionalHeader =
@@ -13,6 +14,62 @@ function requireFullRevision(value, label) {
     throw new Error(`${label} must be a full lowercase commit SHA`);
   }
   return revision;
+}
+
+function requireSafeRelativePath(value, label) {
+  const text = String(value || "");
+  if (!text || path.isAbsolute(text) || text.split(/[\\/]/).includes("..")) {
+    throw new Error(`trusted release manifest has invalid ${label}`);
+  }
+  return text;
+}
+
+export function validateTrustedRelease({
+  manifest,
+  requestedVersion,
+  requestedSourceRevision,
+  workflowRef,
+  defaultBranch,
+  workflowPath,
+  policyPath,
+}) {
+  if (
+    !manifest
+    || manifest.schemaVersion !== 1
+    || manifest.defaultBranch !== "main"
+    || defaultBranch !== manifest.defaultBranch
+    || workflowRef !== `refs/heads/${manifest.defaultBranch}`
+  ) {
+    throw new Error("Release must run from the protected default branch in the trusted release manifest");
+  }
+  if (
+    manifest.workflowPath !== workflowPath
+    || manifest.policy?.path !== policyPath
+    || !/^[a-z0-9][a-z0-9-]*$/.test(String(manifest.policy?.id || ""))
+  ) {
+    throw new Error("Workflow or policy does not match the trusted release manifest");
+  }
+  const release = manifest.releases?.[requestedVersion];
+  if (
+    !/^\d+\.\d+\.\d+$/.test(String(requestedVersion || ""))
+    || !release
+    || release.sourceRevision !== requestedSourceRevision
+    || !/^[0-9a-f]{40}$/.test(String(release.sourceRevision || ""))
+    || release.artifactName !== `${release.archiveRoot}_v${requestedVersion}.zip`
+    || release.changelogHeading?.includes(requestedVersion) !== true
+  ) {
+    throw new Error("Requested source or version does not match the trusted release manifest");
+  }
+  for (const field of [
+    "artifactName",
+    "archiveRoot",
+    "prepareScript",
+    "changelogFile",
+    "releaseNotesFile",
+  ]) {
+    requireSafeRelativePath(release[field], `releases.${requestedVersion}.${field}`);
+  }
+  return release;
 }
 
 function parseVersion(value, label) {
@@ -144,6 +201,16 @@ function runCli(argv) {
     throw new Error("--repository is required");
   }
   const sourceRevision = requireFullRevision(args.sourceSha, "source revision");
+  const manifest = JSON.parse(fs.readFileSync(args.releaseManifest, "utf8"));
+  const trustedRelease = validateTrustedRelease({
+    manifest,
+    requestedVersion: args.version,
+    requestedSourceRevision: sourceRevision,
+    workflowRef: args.workflowRef,
+    defaultBranch: args.defaultBranch,
+    workflowPath: args.workflowPath,
+    policyPath: args.policyPath,
+  });
   git(repository, ["cat-file", "-e", `${sourceRevision}^{commit}`]);
   const checkoutRevision = git(repository, ["rev-parse", "HEAD"]);
   const tags = git(repository, [
@@ -168,7 +235,10 @@ function runCli(argv) {
     sha,
     message: git(repository, ["show", "-s", "--format=%B", sha]),
   }));
-  const changelog = fs.readFileSync(args.changelog, "utf8");
+  const changelog = fs.readFileSync(
+    path.join(repository, trustedRelease.changelogFile),
+    "utf8",
+  );
   const evidence = validateReleasePolicy({
     sourceRevision,
     checkoutRevision,
@@ -176,10 +246,18 @@ function runCli(argv) {
     requestedVersion: args.version,
     commits,
     changelog,
-    changelogHeading: args.changelogHeading,
-    policyId: args.policyId,
+    changelogHeading: trustedRelease.changelogHeading,
+    policyId: manifest.policy.id,
     policyRevision: args.policyRevision,
   });
+  evidence.workflowPath = manifest.workflowPath;
+  evidence.policyPath = manifest.policy.path;
+  evidence.package = {
+    artifactName: trustedRelease.artifactName,
+    archiveRoot: trustedRelease.archiveRoot,
+    prepareScript: trustedRelease.prepareScript,
+    releaseNotesFile: trustedRelease.releaseNotesFile,
+  };
   fs.writeFileSync(args.output, `${JSON.stringify(evidence, null, 2)}\n`, {
     flag: "wx",
   });

@@ -11,6 +11,63 @@ test("release policy implementation is repository-local", () => {
   assert.ok(existsSync(policyPath), "scripts/validate-release-policy.mjs must exist");
 });
 
+test("trusted release manifest binds the protected workflow, policy, source, version, and package inputs", async () => {
+  const { validateTrustedRelease } = await import(pathToFileURL(policyPath));
+  const manifest = {
+    schemaVersion: 1,
+    defaultBranch: "main",
+    workflowPath: ".github/workflows/phpreleaser.yml",
+    policy: {
+      id: "woocommerce-plugin-release-v1",
+      path: "scripts/validate-release-policy.mjs",
+    },
+    releases: {
+      "1.2.0": {
+        sourceRevision: "0dc997be6b8e39d391cb542f0ac6dd5377bc7d0f",
+        artifactName: "woocommerce-payment-gateway-app_v1.2.0.zip",
+        archiveRoot: "woocommerce-payment-gateway-app",
+        prepareScript: "scripts/prepare-release.php",
+        changelogFile: "README.md",
+        changelogHeading: "= 1.2.0 =",
+        releaseNotesFile: "RELEASE.md",
+      },
+    },
+  };
+
+  assert.deepEqual(validateTrustedRelease({
+    manifest,
+    requestedVersion: "1.2.0",
+    requestedSourceRevision: "0dc997be6b8e39d391cb542f0ac6dd5377bc7d0f",
+    workflowRef: "refs/heads/main",
+    defaultBranch: "main",
+    workflowPath: ".github/workflows/phpreleaser.yml",
+    policyPath: "scripts/validate-release-policy.mjs",
+  }), manifest.releases["1.2.0"]);
+
+  for (const change of [
+    { requestedSourceRevision: "f".repeat(40) },
+    { requestedVersion: "1.2.1" },
+    { workflowRef: "refs/heads/release/1.2.0" },
+    { defaultBranch: "develop" },
+    { workflowPath: ".github/workflows/other.yml" },
+    { policyPath: "scripts/other-policy.mjs" },
+  ]) {
+    assert.throws(
+      () => validateTrustedRelease({
+        manifest,
+        requestedVersion: "1.2.0",
+        requestedSourceRevision: "0dc997be6b8e39d391cb542f0ac6dd5377bc7d0f",
+        workflowRef: "refs/heads/main",
+        defaultBranch: "main",
+        workflowPath: ".github/workflows/phpreleaser.yml",
+        policyPath: "scripts/validate-release-policy.mjs",
+        ...change,
+      }),
+      /trusted release manifest|protected default branch/i,
+    );
+  }
+});
+
 test("release policy CLI maps documented kebab-case arguments", async () => {
   const { parseCliArgs } = await import(pathToFileURL(policyPath));
   assert.deepEqual(
