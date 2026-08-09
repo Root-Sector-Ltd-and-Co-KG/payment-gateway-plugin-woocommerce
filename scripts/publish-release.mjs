@@ -56,6 +56,30 @@ function indexAssets(release, expectedNames) {
   return indexed;
 }
 
+function validateReleaseMetadata(release, expected, label) {
+  if (
+    !release
+    || release.tagName !== expected.version
+    || release.title !== expected.title
+    || release.body !== expected.notes
+    || release.prerelease !== false
+    || release.draft !== expected.draft
+  ) {
+    throw new Error(`${label} release metadata does not match the validated publication`);
+  }
+}
+
+async function validateExactAssets(github, release, expected, expectedNames) {
+  const indexed = indexAssets(release, expectedNames);
+  if (indexed.size !== expected.length) {
+    throw new Error(`Release ${release.tagName} does not contain all expected assets`);
+  }
+  for (const local of expected) {
+    await validateRemoteAsset(github, indexed.get(local.name), local);
+  }
+  return indexed;
+}
+
 export async function publishPluginRelease({
   repository,
   version,
@@ -83,16 +107,11 @@ export async function publishPluginRelease({
   if (release && release.draft !== true) {
     throw new Error(`Published release ${version} is immutable and must be refused`);
   }
-  if (release && release.tagName !== version) {
-    throw new Error(`Draft release tag ${release.tagName} does not match ${version}`);
-  }
   if (!release) {
     await github.createDraftRelease({ tagName: version, title, notes });
     release = await github.getRelease(version);
   }
-  if (!release || release.draft !== true) {
-    throw new Error(`Could not establish draft release ${version}`);
-  }
+  validateReleaseMetadata(release, { version, title, notes, draft: true }, "Draft");
 
   let indexed = indexAssets(release, expectedNames);
   for (const local of expected) {
@@ -111,18 +130,15 @@ export async function publishPluginRelease({
   }
 
   release = await github.getRelease(version);
-  if (!release || release.draft !== true) {
-    throw new Error(`Draft release ${version} disappeared before verification`);
-  }
-  indexed = indexAssets(release, expectedNames);
-  if (indexed.size !== expected.length) {
-    throw new Error(`Draft release ${version} does not contain all expected assets`);
-  }
-  for (const local of expected) {
-    await validateRemoteAsset(github, indexed.get(local.name), local);
-  }
+  validateReleaseMetadata(release, { version, title, notes, draft: true }, "Draft");
+  await validateExactAssets(github, release, expected, expectedNames);
 
-  await github.publishRelease(release.id);
+  const published = await github.publishRelease(release.id, { title, notes });
+  validateReleaseMetadata(published, { version, title, notes, draft: false }, "Published");
+
+  const finalRelease = await github.getRelease(version);
+  validateReleaseMetadata(finalRelease, { version, title, notes, draft: false }, "Final");
+  await validateExactAssets(github, finalRelease, expected, expectedNames);
 }
 
 function ghFailureIs404(error) {
@@ -141,6 +157,23 @@ function ghJson(args, { input, allow404 = false } = {}) {
     if (allow404 && ghFailureIs404(error)) return null;
     throw error;
   }
+}
+
+function mapRelease(release) {
+  if (!release) return null;
+  return {
+    id: release.id,
+    tagName: release.tag_name,
+    title: release.name,
+    body: release.body,
+    draft: release.draft,
+    prerelease: release.prerelease,
+    assets: (release.assets || []).map((asset) => ({
+      id: asset.id,
+      name: asset.name,
+      digest: asset.digest,
+    })),
+  };
 }
 
 export function createGitHubClient(repository) {
@@ -178,17 +211,7 @@ export function createGitHubClient(repository) {
         ["api", "--method", "GET", `repos/${repository}/releases/tags/${encodeURIComponent(version)}`],
         { allow404: true },
       );
-      if (!release) return null;
-      return {
-        id: release.id,
-        tagName: release.tag_name,
-        draft: release.draft,
-        assets: (release.assets || []).map((asset) => ({
-          id: asset.id,
-          name: asset.name,
-          digest: asset.digest,
-        })),
-      };
+      return mapRelease(release);
     },
     async createDraftRelease({ tagName, title, notes }) {
       return ghJson(
@@ -225,11 +248,18 @@ export function createGitHubClient(repository) {
         { stdio: ["ignore", "pipe", "pipe"] },
       );
     },
-    async publishRelease(releaseId) {
-      ghJson(
+    async publishRelease(releaseId, { title, notes }) {
+      return mapRelease(ghJson(
         ["api", "--method", "PATCH", `repos/${repository}/releases/${releaseId}`, "--input", "-"],
-        { input: JSON.stringify({ draft: false }) },
-      );
+        {
+          input: JSON.stringify({
+            name: title,
+            body: notes,
+            draft: false,
+            prerelease: false,
+          }),
+        },
+      ));
     },
   };
 }

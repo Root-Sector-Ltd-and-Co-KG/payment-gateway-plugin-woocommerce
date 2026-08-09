@@ -1,0 +1,26 @@
+name: Validate WooCommerce Release Controls
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout pull request source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Validate receiver and release controls
+        run: |
+          php tests/api-error-context.test.php
+          php tests/customer-risk-integration.test.php
+          php tests/customer-risk-error-context.test.php
+          php tests/ipn-v2-receiver.test.php
+          php tests/release-workflow.test.php
+          node --test tests/release-policy.test.mjs tests/release-workflow.test.mjs tests/publish-release.test.mjs

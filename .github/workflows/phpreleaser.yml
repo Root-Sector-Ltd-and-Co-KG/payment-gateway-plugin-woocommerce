@@ -1,28 +1,19 @@
 name: Validate and Release WooCommerce Plugin
 
 on:
-  pull_request:
-  workflow_dispatch:
-    inputs:
-      source_sha:
-        description: "Exact reviewed plugin source commit to tag"
-        required: true
-        type: string
-      version:
-        description: "Exact x.y.z plugin version to publish"
-        required: true
-        type: string
+  repository_dispatch:
+    types: [plugin-release-approved]
 
 permissions:
   contents: read
 
 concurrency:
-  group: woo-plugin-release-${{ github.event_name }}-${{ inputs.version || github.ref }}
+  group: woo-plugin-release-${{ github.event.client_payload.version }}
   cancel-in-progress: false
 
 env:
-  SOURCE_SHA: ${{ inputs.source_sha || github.sha }}
-  PLUGIN_RELEASE_VERSION: ${{ inputs.version || '' }}
+  SOURCE_SHA: ${{ github.event.client_payload.source_sha }}
+  PLUGIN_RELEASE_VERSION: ${{ github.event.client_payload.version }}
   RELEASE_POLICY_REVISION: ${{ github.sha }}
   RELEASE_POLICY_MANIFEST: release-control/.github/release-policy.json
   RELEASE_WORKFLOW_PATH: .github/workflows/phpreleaser.yml
@@ -37,16 +28,23 @@ jobs:
       contents: read
     steps:
       - name: Require protected default-branch release controls
-        if: github.event_name == 'workflow_dispatch'
         env:
+          CLIENT_PAYLOAD: ${{ toJSON(github.event.client_payload) }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          EVENT_NAME: ${{ github.event_name }}
           WORKFLOW_REF: ${{ github.ref }}
           WORKFLOW_REF_PROTECTED: ${{ github.ref_protected }}
         run: |
-          if [[ "$DEFAULT_BRANCH" != "main" || "$WORKFLOW_REF" != "refs/heads/main" || "$WORKFLOW_REF_PROTECTED" != "true" ]]; then
+          if [[ "$EVENT_NAME" != "repository_dispatch" || "$DEFAULT_BRANCH" != "main" || "$WORKFLOW_REF" != "refs/heads/main" || "$WORKFLOW_REF_PROTECTED" != "true" ]]; then
             echo "::error::Release publication must run from refs/heads/main, the protected default branch."
             exit 1
           fi
+          jq -e '
+            (type == "object") and
+            (keys | sort == ["source_sha", "version"]) and
+            (.source_sha | type == "string" and test("^[0-9a-f]{40}$")) and
+            (.version | type == "string" and test("^[0-9]+\\.[0-9]+\\.[0-9]+$"))
+          ' <<< "$CLIENT_PAYLOAD" >/dev/null
 
       - name: Checkout release controls
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -91,7 +89,6 @@ jobs:
           node --test release-control/tests/release-policy.test.mjs release-control/tests/release-workflow.test.mjs release-control/tests/publish-release.test.mjs
 
       - name: Validate trusted release manifest, policy, and source
-        if: github.event_name == 'workflow_dispatch'
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
           WORKFLOW_REF: ${{ github.ref }}
@@ -130,7 +127,6 @@ jobs:
 
 
       - name: Build exact versioned archive, checksum, and validation evidence
-        if: github.event_name == 'workflow_dispatch'
         env:
           REPOSITORY: ${{ github.repository }}
         run: |
@@ -161,7 +157,6 @@ jobs:
             }' plugin-release-validation.json > release-bundle/plugin-release-validation.json
 
       - name: Transfer validated release bundle
-        if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-bundle-${{ github.run_id }}
@@ -171,7 +166,6 @@ jobs:
 
   publish:
     name: Publish verified immutable plugin release
-    if: github.event_name == 'workflow_dispatch'
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 15

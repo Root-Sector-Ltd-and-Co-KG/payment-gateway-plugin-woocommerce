@@ -6,11 +6,15 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const workflow = fs.readFileSync(path.join(root, ".github/workflows/phpreleaser.yml"), "utf8");
+const prWorkflowPath = path.join(root, ".github/workflows/validate-release-controls.yml");
+const prWorkflow = fs.existsSync(prWorkflowPath) ? fs.readFileSync(prWorkflowPath, "utf8") : "";
 
-test("Woo release is manually dispatched for an exact source and version", () => {
-  assert.match(workflow, /workflow_dispatch:/);
-  assert.match(workflow, /source_sha:/);
-  assert.match(workflow, /version:/);
+test("Woo publication is only repository-dispatched from default-branch controls", () => {
+  assert.match(workflow, /repository_dispatch:\s*\n\s+types:\s*\[plugin-release-approved\]/);
+  assert.match(workflow, /github\.event\.client_payload\.source_sha/);
+  assert.match(workflow, /github\.event\.client_payload\.version/);
+  assert.match(workflow, /keys \| sort == \[\"source_sha\", \"version\"\]/);
+  assert.doesNotMatch(workflow, /workflow_dispatch:|pull_request:/);
   assert.doesNotMatch(workflow, /push:\s*\n\s*tags:/);
   assert.match(workflow, /^permissions:\s*\n\s+contents: read$/m);
   assert.doesNotMatch(workflow, /issues: write|pull-requests: write|packages: write/);
@@ -22,8 +26,16 @@ test("Woo release is manually dispatched for an exact source and version", () =>
   assert.match(workflow, /\.github\/release-policy\.json/);
 });
 
-test("every action in the Woo release workflow is pinned to a reviewed commit", () => {
-  const actionLines = workflow.split("\n").filter((line) => /\buses:/.test(line));
+test("Woo PR validation is separate and cannot publish", () => {
+  assert.ok(prWorkflow, "read-only PR validation workflow must exist");
+  assert.match(prWorkflow, /pull_request:/);
+  assert.match(prWorkflow, /^permissions:\s*\n\s+contents: read$/m);
+  assert.doesNotMatch(prWorkflow, /contents: write|repository_dispatch:|workflow_dispatch:|GH_TOKEN:/);
+  assert.match(prWorkflow, /node --test tests\/release-policy\.test\.mjs tests\/release-workflow\.test\.mjs tests\/publish-release\.test\.mjs/);
+});
+
+test("every action in Woo release-control workflows is pinned to a reviewed commit", () => {
+  const actionLines = `${workflow}\n${prWorkflow}`.split("\n").filter((line) => /\buses:/.test(line));
   assert.ok(actionLines.length > 0);
   for (const line of actionLines) {
     assert.match(line, /uses:\s+[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+@[0-9a-f]{40}\s+#\s+v\S+\s*$/);

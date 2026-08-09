@@ -83,9 +83,12 @@ try {
     releaseAssertSame(true, $duplicateChangelogRejected, 'A duplicate version entry inside Changelog must be rejected.');
 
     $workflow = file_get_contents(dirname(__DIR__) . '/.github/workflows/phpreleaser.yml');
-    releaseAssertContains('workflow_dispatch:', $workflow, 'Publication must require a manual pre-tag dispatch.');
-    releaseAssertContains('source_sha:', $workflow, 'Publication must select an exact reviewed source commit.');
-    releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ inputs.version', $workflow, 'Publication must use the selected semantic version.');
+    releaseAssertContains('repository_dispatch:', $workflow, 'Publication must use the default-branch repository dispatch event.');
+    releaseAssertContains('types: [plugin-release-approved]', $workflow, 'Publication must require the approved release event type.');
+    releaseAssertContains('github.event.client_payload.source_sha', $workflow, 'Publication must select an exact reviewed source commit.');
+    releaseAssertContains('PLUGIN_RELEASE_VERSION: ${{ github.event.client_payload.version', $workflow, 'Publication must use the selected semantic version.');
+    releaseAssertNotContains('workflow_dispatch:', $workflow, 'Privileged publication must not be ref-selectable.');
+    releaseAssertNotContains('pull_request:', $workflow, 'Privileged publication must not execute from pull request source.');
     releaseAssertContains('refs/heads/main', $workflow, 'Publication must execute from the protected default branch.');
     releaseAssertContains('github.ref_protected', $workflow, 'Publication must require GitHub to identify the workflow ref as protected.');
     releaseAssertContains('.github/release-policy.json', $workflow, 'Publication must use the trusted repository release manifest.');
@@ -100,6 +103,10 @@ try {
     releaseAssertContains('scripts/publish-release.mjs', $workflow, 'Publication must verify a resumable draft before making the release visible.');
     releaseAssertContains('persist-credentials: false', $workflow, 'Publication checkouts must not retain write credentials.');
     releaseAssertContains('release-control/$PREPARE_SCRIPT', $workflow, 'Packaging must use the trusted control-tree packager.');
+    $prWorkflow = file_get_contents(dirname(__DIR__) . '/.github/workflows/validate-release-controls.yml');
+    releaseAssertContains('pull_request:', $prWorkflow, 'Pull requests must retain read-only release-control validation.');
+    releaseAssertContains("permissions:\n  contents: read", $prWorkflow, 'Pull request validation must default to contents read.');
+    releaseAssertNotContains('contents: write', $prWorkflow, 'Pull request validation must never publish.');
     releaseAssertNotContains('--clobber', $workflow, 'Publication must never replace a release asset.');
     releaseAssertContains('npm ci', $workflow, 'The release validation workflow must install its locked WordPress environment.');
     releaseAssertContains('npm run wp-env -- start', $workflow, 'The release validation workflow must start a genuine WordPress environment.');
