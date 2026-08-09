@@ -550,6 +550,100 @@ ipnAssertSame('applied', $explicitReplacementResult, 'An explicitly rebound repl
 ipnAssertSame('processing', $explicitReplacementOrder->status, 'An explicitly rebound replacement attempt may repay a refunded order.');
 ipnAssertSame('transaction-replacement', $explicitReplacementOrder->transactionId, 'Explicit replacement binding must remain authoritative.');
 
+// A replacement delivery may recover the same logical event after its first effect was interrupted.
+$replacementOrder = new FakeIPNOrder();
+$replacementPayload = v2Payload('delivery-replacement-original', 1, 0);
+$replacementBody = json_encode($replacementPayload, JSON_THROW_ON_ERROR);
+$replacementEffects = 0;
+try {
+    WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $replacementOrder,
+        'transaction-123',
+        $replacementPayload,
+        $replacementBody,
+        static function (FakeIPNOrder $effectOrder) use (&$replacementEffects): void {
+            if ($effectOrder->status !== 'on-hold') {
+                $replacementEffects++;
+                $effectOrder->update_status('on-hold');
+            }
+            throw new RuntimeException('simulated post-effect interruption');
+        }
+    );
+} catch (RuntimeException $error) {
+    ipnAssertSame('simulated post-effect interruption', $error->getMessage(), 'The simulated interruption must happen after the first effect.');
+}
+$equivalentReplacementPayload = array_merge($replacementPayload, array(
+    'deliveryId' => 'delivery-replacement-equivalent',
+    'occurredAt' => '2026-07-26T18:31:00Z',
+));
+$equivalentReplacementBody = json_encode($equivalentReplacementPayload, JSON_THROW_ON_ERROR);
+$equivalentReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $replacementOrder,
+    'transaction-123',
+    $equivalentReplacementPayload,
+    $equivalentReplacementBody,
+    static function (FakeIPNOrder $effectOrder) use (&$replacementEffects): void {
+        if ($effectOrder->status !== 'on-hold') {
+            $replacementEffects++;
+            $effectOrder->update_status('on-hold');
+        }
+    }
+);
+ipnAssertSame('applied', $equivalentReplacementResult, 'A different delivery ID with equivalent effect semantics must recover the pending event.');
+ipnAssertSame(1, $replacementEffects, 'Equivalent replacement recovery must not repeat an effect already made durable.');
+$replacementState = $replacementOrder->get_meta(
+    WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123'),
+    true
+);
+ipnAssertSame('superseded', $replacementState['deliveries'][$replacementPayload['deliveryId']]['phase'] ?? null, 'The interrupted delivery must become terminal after replacement recovery.');
+ipnAssertSame('applied', $replacementState['deliveries'][$equivalentReplacementPayload['deliveryId']]['phase'] ?? null, 'The equivalent replacement must retain the applied acknowledgement.');
+
+$contradictoryReplacementPayload = array_merge($equivalentReplacementPayload, array(
+    'deliveryId' => 'delivery-replacement-contradictory',
+    'status' => 2,
+));
+$contradictoryReplacementBody = json_encode($contradictoryReplacementPayload, JSON_THROW_ON_ERROR);
+$contradictoryReplacementEffects = 0;
+$contradictoryReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $replacementOrder,
+    'transaction-123',
+    $contradictoryReplacementPayload,
+    $contradictoryReplacementBody,
+    static function () use (&$contradictoryReplacementEffects): void {
+        $contradictoryReplacementEffects++;
+    }
+);
+ipnAssertSame('conflict', $contradictoryReplacementResult, 'A different delivery ID must not redefine the effect semantics of a transaction event version.');
+ipnAssertSame(0, $contradictoryReplacementEffects, 'A contradictory replacement must fail before running an effect.');
+
+$legacyStateOrder = new FakeIPNOrder();
+$legacyStatePayload = v2Payload('delivery-legacy-state', 1, 1);
+$legacyStateBody = json_encode($legacyStatePayload, JSON_THROW_ON_ERROR);
+$legacyStateMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123');
+$legacyStateOrder->update_meta_data($legacyStateMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $legacyStatePayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $legacyStateBody),
+            'phase' => 'applied',
+        ),
+    ),
+));
+$legacyStateResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyStateOrder,
+    'transaction-123',
+    $legacyStatePayload,
+    $legacyStateBody,
+    static function (): void {
+        throw new RuntimeException('A legacy applied delivery must remain duplicate-safe.');
+    }
+);
+ipnAssertSame('duplicate', $legacyStateResult, 'Persisted format-v1 delivery state must remain readable and duplicate-safe.');
+$upgradedLegacyState = $legacyStateOrder->get_meta($legacyStateMetaKey, true);
+ipnAssertSame(1, count($upgradedLegacyState['eventIdentities'] ?? array()), 'An exact legacy-state retry must durably backfill its effect identity.');
+
 // A crash-pending event that is superseded remains safely acknowledgeable on every retry.
 $pendingOrder = new FakeIPNOrder();
 $pendingPayload = v2Payload('delivery-pending', 1, 0);
@@ -589,6 +683,7 @@ for ($version = 1; $version <= 101; $version++) {
 $retentionKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-retained');
 $retainedState = $retentionOrder->get_meta($retentionKey, true);
 ipnAssertSame(100, count($retainedState['deliveries']), 'Processed delivery identity retention must remain bounded.');
+ipnAssertSame(100, count($retainedState['eventIdentities'] ?? array()), 'Effect-relevant event identity retention must remain bounded with delivery state.');
 
 $replayPayload = v2Payload('delivery-retained-1', 1, 2);
 $replayBody = json_encode($replayPayload, JSON_THROW_ON_ERROR);

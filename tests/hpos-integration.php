@@ -241,8 +241,88 @@ try {
     $pendingState = $afterPendingClaims->get_meta($pendingMetaKey, true);
     hposAssertSame('superseded', $pendingState['deliveries'][$pendingOne['deliveryId']]['phase'] ?? null, 'A newer HPOS event must proactively supersede the older pending claim.');
     hposAssertSame('pending', $pendingState['deliveries'][$pendingTwo['deliveryId']]['phase'] ?? null, 'The newest interrupted HPOS event must remain recoverable.');
-    $afterPendingClaims->set_transaction_id($transactionId);
+
+    $replacementTransactionId = 'hpos-replacement-transaction-' . $orderId;
+    $replacementMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key($replacementTransactionId);
+    $afterPendingClaims->set_transaction_id($replacementTransactionId);
+    $afterPendingClaims->set_status('pending');
     $afterPendingClaims->save();
+    $replacementPayload = array_merge($firstPayload, array(
+        'deliveryId' => 'hpos-replacement-original-' . $orderId,
+        'id' => $replacementTransactionId,
+        'status' => 0,
+    ));
+    $replacementBody = wp_json_encode($replacementPayload, JSON_THROW_ON_ERROR);
+    $replacementEffects = 0;
+    try {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $afterPendingClaims,
+            $replacementTransactionId,
+            $replacementPayload,
+            $replacementBody,
+            static function (WC_Order $effectOrder) use (&$replacementEffects): void {
+                if ($effectOrder->get_status() !== 'on-hold') {
+                    $replacementEffects++;
+                    $effectOrder->update_status('on-hold');
+                }
+                throw new RuntimeException('simulated replacement post-effect interruption');
+            }
+        );
+    } catch (RuntimeException $error) {
+        hposAssertSame('simulated replacement post-effect interruption', $error->getMessage(), 'The original HPOS delivery must be interrupted after its effect.');
+    }
+
+    $afterReplacementInterruption = wc_get_order($orderId);
+    hposAssert($afterReplacementInterruption instanceof WC_Order, 'The interrupted replacement order must reload through HPOS.');
+    hposAssertSame('on-hold', $afterReplacementInterruption->get_status(), 'The interrupted effect must be durable before replacement recovery.');
+    $equivalentReplacementPayload = array_merge($replacementPayload, array(
+        'deliveryId' => 'hpos-replacement-equivalent-' . $orderId,
+        'occurredAt' => '2026-08-08T12:01:00Z',
+    ));
+    $equivalentReplacementBody = wp_json_encode($equivalentReplacementPayload, JSON_THROW_ON_ERROR);
+    $equivalentReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $afterReplacementInterruption,
+        $replacementTransactionId,
+        $equivalentReplacementPayload,
+        $equivalentReplacementBody,
+        static function (WC_Order $effectOrder) use (&$replacementEffects): void {
+            if ($effectOrder->get_status() !== 'on-hold') {
+                $replacementEffects++;
+                $effectOrder->update_status('on-hold');
+            }
+        }
+    );
+    hposAssertSame('applied', $equivalentReplacementResult, 'Equivalent replacement recovery must apply through HPOS.');
+    hposAssertSame(1, $replacementEffects, 'Equivalent HPOS replacement recovery must not repeat a durable effect.');
+
+    $afterEquivalentReplacement = wc_get_order($orderId);
+    hposAssert($afterEquivalentReplacement instanceof WC_Order, 'The equivalent replacement result must reload through HPOS.');
+    $replacementState = $afterEquivalentReplacement->get_meta($replacementMetaKey, true);
+    hposAssertSame('superseded', $replacementState['deliveries'][$replacementPayload['deliveryId']]['phase'] ?? null, 'The interrupted HPOS delivery must become terminal after replacement.');
+    hposAssertSame('applied', $replacementState['deliveries'][$equivalentReplacementPayload['deliveryId']]['phase'] ?? null, 'The equivalent HPOS replacement must retain its applied acknowledgement.');
+
+    $contradictoryReplacementPayload = array_merge($equivalentReplacementPayload, array(
+        'deliveryId' => 'hpos-replacement-contradictory-' . $orderId,
+        'status' => 2,
+    ));
+    $contradictoryReplacementBody = wp_json_encode($contradictoryReplacementPayload, JSON_THROW_ON_ERROR);
+    $contradictoryReplacementEffects = 0;
+    $contradictoryReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $afterEquivalentReplacement,
+        $replacementTransactionId,
+        $contradictoryReplacementPayload,
+        $contradictoryReplacementBody,
+        static function () use (&$contradictoryReplacementEffects): void {
+            $contradictoryReplacementEffects++;
+        }
+    );
+    hposAssertSame('conflict', $contradictoryReplacementResult, 'Contradictory replacement semantics must return the HPOS identity-conflict result.');
+    hposAssertSame(0, $contradictoryReplacementEffects, 'A contradictory HPOS replacement must fail before its effect.');
+    hposAssertSame('on-hold', wc_get_order($orderId)->get_status(), 'A contradictory replacement must not mutate the HPOS order.');
+
+    $afterEquivalentReplacement->set_transaction_id($transactionId);
+    $afterEquivalentReplacement->set_status('failed');
+    $afterEquivalentReplacement->save();
 
     $finalOrder = wc_get_order($orderId);
     hposAssert($finalOrder instanceof WC_Order, 'The final order must reload.');

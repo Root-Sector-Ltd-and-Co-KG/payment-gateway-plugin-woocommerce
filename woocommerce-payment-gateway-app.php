@@ -191,6 +191,8 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
         $delivery_id = (string) $payload['deliveryId'];
         $event_version = (int) $payload['eventVersion'];
         $body_hash = hash('sha256', (string) $raw_body);
+        $effect_identity = self::effect_identity($payload);
+        $event_identity_key = (string) $event_version;
 
         if (isset($state['deliveries'][$delivery_id])) {
             $delivery = $state['deliveries'][$delivery_id];
@@ -200,6 +202,15 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
                 || !hash_equals((string) $delivery['bodyHash'], $body_hash)
             ) {
                 return 'conflict';
+            }
+            if (isset($state['eventIdentities'][$event_identity_key])) {
+                if (!hash_equals((string) $state['eventIdentities'][$event_identity_key], $effect_identity)) {
+                    return 'conflict';
+                }
+            } else {
+                $state['eventIdentities'][$event_identity_key] = $effect_identity;
+                $state = self::trim_deliveries($state);
+                self::save_state($order, $meta_key, $state);
             }
             if ($delivery['phase'] === 'applied') {
                 return 'duplicate';
@@ -217,20 +228,45 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
                 return 'outdated';
             }
         } else {
-            if ($event_version <= $state['highestEventVersion']) {
+            if ($event_version < $state['highestEventVersion']) {
                 return 'outdated';
             }
-            foreach ($state['deliveries'] as &$known_delivery) {
-                if (
-                    isset($known_delivery['eventVersion'], $known_delivery['phase'])
-                    && $known_delivery['phase'] === 'pending'
-                    && (int) $known_delivery['eventVersion'] < $event_version
-                ) {
-                    $known_delivery['phase'] = 'superseded';
+            if ($event_version === $state['highestEventVersion']) {
+                if (!isset($state['eventIdentities'][$event_identity_key])) {
+                    return 'outdated';
                 }
+                if (!hash_equals((string) $state['eventIdentities'][$event_identity_key], $effect_identity)) {
+                    return 'conflict';
+                }
+                $recoverable = false;
+                foreach ($state['deliveries'] as &$known_delivery) {
+                    if (
+                        isset($known_delivery['eventVersion'], $known_delivery['phase'])
+                        && $known_delivery['phase'] === 'pending'
+                        && (int) $known_delivery['eventVersion'] === $event_version
+                    ) {
+                        $known_delivery['phase'] = 'superseded';
+                        $recoverable = true;
+                    }
+                }
+                unset($known_delivery);
+                if (!$recoverable) {
+                    return 'duplicate';
+                }
+            } else {
+                foreach ($state['deliveries'] as &$known_delivery) {
+                    if (
+                        isset($known_delivery['eventVersion'], $known_delivery['phase'])
+                        && $known_delivery['phase'] === 'pending'
+                        && (int) $known_delivery['eventVersion'] < $event_version
+                    ) {
+                        $known_delivery['phase'] = 'superseded';
+                    }
+                }
+                unset($known_delivery);
+                $state['highestEventVersion'] = $event_version;
+                $state['eventIdentities'][$event_identity_key] = $effect_identity;
             }
-            unset($known_delivery);
-            $state['highestEventVersion'] = $event_version;
             $state['deliveries'][$delivery_id] = array(
                 'eventVersion' => $event_version,
                 'bodyHash' => $body_hash,
@@ -265,6 +301,7 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
                 'formatVersion' => self::STATE_FORMAT_VERSION,
                 'highestEventVersion' => 0,
                 'deliveries' => array(),
+                'eventIdentities' => array(),
             );
         }
         if (
@@ -277,7 +314,35 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
         ) {
             throw new UnexpectedValueException('Invalid persisted IPN v2 state.');
         }
+        if (!isset($stored_state['eventIdentities'])) {
+            $stored_state['eventIdentities'] = array();
+        }
+        if (!is_array($stored_state['eventIdentities'])) {
+            throw new UnexpectedValueException('Invalid persisted IPN v2 event identities.');
+        }
+        foreach ($stored_state['eventIdentities'] as $event_version => $effect_identity) {
+            if (
+                (int) $event_version <= 0
+                || !is_string($effect_identity)
+                || preg_match('/\A[a-f0-9]{64}\z/', $effect_identity) !== 1
+            ) {
+                throw new UnexpectedValueException('Invalid persisted IPN v2 event identity.');
+            }
+        }
         return $stored_state;
+    }
+
+    private static function effect_identity(array $payload)
+    {
+        $effect_semantics = array(
+            'id' => isset($payload['id']) && is_scalar($payload['id']) ? (string) $payload['id'] : null,
+            'externalReference' => isset($payload['externalReference']) && is_scalar($payload['externalReference']) ? (string) $payload['externalReference'] : null,
+            'status' => array_key_exists('status', $payload) ? $payload['status'] : null,
+        );
+        return hash('sha256', json_encode(
+            $effect_semantics,
+            JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR
+        ));
     }
 
     private static function save_state($order, $meta_key, array $state)
@@ -302,6 +367,17 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             }
             if (!$removed) {
                 break;
+            }
+        }
+        $retained_event_versions = array();
+        foreach ($state['deliveries'] as $delivery) {
+            if (isset($delivery['eventVersion'])) {
+                $retained_event_versions[(string) (int) $delivery['eventVersion']] = true;
+            }
+        }
+        foreach ($state['eventIdentities'] as $event_version => $unused_effect_identity) {
+            if (!isset($retained_event_versions[(string) (int) $event_version])) {
+                unset($state['eventIdentities'][$event_version]);
             }
         }
         return $state;
