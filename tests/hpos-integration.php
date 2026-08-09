@@ -320,9 +320,106 @@ try {
     hposAssertSame(0, $contradictoryReplacementEffects, 'A contradictory HPOS replacement must fail before its effect.');
     hposAssertSame('on-hold', wc_get_order($orderId)->get_status(), 'A contradictory replacement must not mutate the HPOS order.');
 
-    $afterEquivalentReplacement->set_transaction_id($transactionId);
-    $afterEquivalentReplacement->set_status('failed');
+    $legacyPendingTransactionId = 'hpos-legacy-pending-transaction-' . $orderId;
+    $legacyPendingMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key($legacyPendingTransactionId);
+    $legacyPendingPayload = array_merge($firstPayload, array(
+        'deliveryId' => 'hpos-legacy-pending-original-' . $orderId,
+        'id' => $legacyPendingTransactionId,
+        'status' => 0,
+    ));
+    $legacyPendingBody = wp_json_encode($legacyPendingPayload, JSON_THROW_ON_ERROR);
+    $afterEquivalentReplacement->set_transaction_id($legacyPendingTransactionId);
+    $afterEquivalentReplacement->set_status('pending');
+    $afterEquivalentReplacement->update_meta_data($legacyPendingMetaKey, array(
+        'formatVersion' => 1,
+        'highestEventVersion' => 1,
+        'deliveries' => array(
+            $legacyPendingPayload['deliveryId'] => array(
+                'eventVersion' => 1,
+                'bodyHash' => hash('sha256', $legacyPendingBody),
+                'phase' => 'pending',
+            ),
+        ),
+    ));
     $afterEquivalentReplacement->save();
+
+    $legacyPendingOrder = wc_get_order($orderId);
+    hposAssert($legacyPendingOrder instanceof WC_Order, 'The injected legacy pending state must reload through HPOS.');
+    $unprovableLegacyReplacement = array_merge($legacyPendingPayload, array(
+        'deliveryId' => 'hpos-legacy-pending-unprovable-' . $orderId,
+        'occurredAt' => '2026-08-08T12:02:00Z',
+    ));
+    $unprovableLegacyReplacementBody = wp_json_encode($unprovableLegacyReplacement, JSON_THROW_ON_ERROR);
+    $unprovableLegacyEffects = 0;
+    $unprovableLegacyResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $legacyPendingOrder,
+        $legacyPendingTransactionId,
+        $unprovableLegacyReplacement,
+        $unprovableLegacyReplacementBody,
+        static function () use (&$unprovableLegacyEffects): void {
+            $unprovableLegacyEffects++;
+        }
+    );
+    hposAssertSame('conflict', $unprovableLegacyResult, 'An unprovable different-ID legacy pending replacement must conflict through HPOS.');
+    hposAssertSame(0, $unprovableLegacyEffects, 'An unprovable legacy HPOS replacement must not run an effect.');
+
+    try {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $legacyPendingOrder,
+            $legacyPendingTransactionId,
+            $legacyPendingPayload,
+            $legacyPendingBody,
+            static function (): void {
+                throw new RuntimeException('simulated HPOS legacy pending retry interruption');
+            }
+        );
+    } catch (RuntimeException $error) {
+        hposAssertSame('simulated HPOS legacy pending retry interruption', $error->getMessage(), 'The exact legacy HPOS retry must reach effect recovery.');
+    }
+
+    $backfilledLegacyPendingOrder = wc_get_order($orderId);
+    hposAssert($backfilledLegacyPendingOrder instanceof WC_Order, 'The backfilled legacy pending state must reload through HPOS.');
+    $backfilledLegacyPendingState = $backfilledLegacyPendingOrder->get_meta($legacyPendingMetaKey, true);
+    hposAssertSame(1, count($backfilledLegacyPendingState['eventIdentities'] ?? array()), 'The exact HPOS retry must durably backfill legacy effect identity.');
+    hposAssertSame('pending', $backfilledLegacyPendingState['deliveries'][$legacyPendingPayload['deliveryId']]['phase'] ?? null, 'The interrupted exact HPOS retry must remain recoverable.');
+
+    $provableLegacyReplacement = array_merge($legacyPendingPayload, array(
+        'deliveryId' => 'hpos-legacy-pending-provable-' . $orderId,
+        'occurredAt' => '2026-08-08T12:03:00Z',
+    ));
+    $provableLegacyReplacementBody = wp_json_encode($provableLegacyReplacement, JSON_THROW_ON_ERROR);
+    $provableLegacyResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $backfilledLegacyPendingOrder,
+        $legacyPendingTransactionId,
+        $provableLegacyReplacement,
+        $provableLegacyReplacementBody,
+        static function (WC_Order $effectOrder): void {
+            $effectOrder->update_status('on-hold');
+        }
+    );
+    hposAssertSame('applied', $provableLegacyResult, 'A legacy HPOS replacement may recover after exact-delivery identity backfill.');
+
+    $afterProvableLegacyReplacement = wc_get_order($orderId);
+    hposAssert($afterProvableLegacyReplacement instanceof WC_Order, 'The recovered legacy HPOS replacement must reload.');
+    $legacyPendingContradiction = array_merge($provableLegacyReplacement, array(
+        'deliveryId' => 'hpos-legacy-pending-contradictory-' . $orderId,
+        'status' => 2,
+    ));
+    $legacyPendingContradictionBody = wp_json_encode($legacyPendingContradiction, JSON_THROW_ON_ERROR);
+    $legacyPendingContradictionResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $afterProvableLegacyReplacement,
+        $legacyPendingTransactionId,
+        $legacyPendingContradiction,
+        $legacyPendingContradictionBody,
+        static function (): void {
+            throw new RuntimeException('A contradictory legacy HPOS replacement must not run an effect.');
+        }
+    );
+    hposAssertSame('conflict', $legacyPendingContradictionResult, 'A legacy HPOS contradiction must conflict after semantic identity backfill.');
+
+    $afterProvableLegacyReplacement->set_transaction_id($transactionId);
+    $afterProvableLegacyReplacement->set_status('failed');
+    $afterProvableLegacyReplacement->save();
 
     $finalOrder = wc_get_order($orderId);
     hposAssert($finalOrder instanceof WC_Order, 'The final order must reload.');

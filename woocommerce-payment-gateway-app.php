@@ -233,6 +233,15 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             }
             if ($event_version === $state['highestEventVersion']) {
                 if (!isset($state['eventIdentities'][$event_identity_key])) {
+                    foreach ($state['deliveries'] as $known_delivery) {
+                        if (
+                            isset($known_delivery['eventVersion'], $known_delivery['phase'])
+                            && $known_delivery['phase'] === 'pending'
+                            && (int) $known_delivery['eventVersion'] === $event_version
+                        ) {
+                            return 'conflict';
+                        }
+                    }
                     return 'outdated';
                 }
                 if (!hash_equals((string) $state['eventIdentities'][$event_identity_key], $effect_identity)) {

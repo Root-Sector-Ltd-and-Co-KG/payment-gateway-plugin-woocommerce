@@ -616,6 +616,88 @@ $contradictoryReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::proce
 ipnAssertSame('conflict', $contradictoryReplacementResult, 'A different delivery ID must not redefine the effect semantics of a transaction event version.');
 ipnAssertSame(0, $contradictoryReplacementEffects, 'A contradictory replacement must fail before running an effect.');
 
+$legacyPendingOrder = new FakeIPNOrder();
+$legacyPendingPayload = v2Payload('delivery-legacy-pending-original', 1, 0);
+$legacyPendingBody = json_encode($legacyPendingPayload, JSON_THROW_ON_ERROR);
+$legacyPendingMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123');
+$legacyPendingOrder->update_meta_data($legacyPendingMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $legacyPendingPayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $legacyPendingBody),
+            'phase' => 'pending',
+        ),
+    ),
+));
+$unprovableLegacyReplacement = array_merge($legacyPendingPayload, array(
+    'deliveryId' => 'delivery-legacy-pending-unprovable',
+    'occurredAt' => '2026-07-26T18:32:00Z',
+));
+$unprovableLegacyReplacementBody = json_encode($unprovableLegacyReplacement, JSON_THROW_ON_ERROR);
+$unprovableLegacyEffects = 0;
+$unprovableLegacyResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyPendingOrder,
+    'transaction-123',
+    $unprovableLegacyReplacement,
+    $unprovableLegacyReplacementBody,
+    static function () use (&$unprovableLegacyEffects): void {
+        $unprovableLegacyEffects++;
+    }
+);
+ipnAssertSame('conflict', $unprovableLegacyResult, 'A different delivery ID must fail closed while legacy pending semantics are unprovable.');
+ipnAssertSame(0, $unprovableLegacyEffects, 'An unprovable legacy replacement must not run an effect.');
+
+try {
+    WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $legacyPendingOrder,
+        'transaction-123',
+        $legacyPendingPayload,
+        $legacyPendingBody,
+        static function (): void {
+            throw new RuntimeException('simulated legacy pending retry interruption');
+        }
+    );
+} catch (RuntimeException $error) {
+    ipnAssertSame('simulated legacy pending retry interruption', $error->getMessage(), 'The exact legacy pending retry must reach effect recovery.');
+}
+$backfilledLegacyPendingState = $legacyPendingOrder->get_meta($legacyPendingMetaKey, true);
+ipnAssertSame(1, count($backfilledLegacyPendingState['eventIdentities'] ?? array()), 'The exact legacy pending retry must durably backfill effect identity before recovery.');
+ipnAssertSame('pending', $backfilledLegacyPendingState['deliveries'][$legacyPendingPayload['deliveryId']]['phase'] ?? null, 'An interrupted exact legacy retry must remain recoverable.');
+
+$provableLegacyReplacement = array_merge($legacyPendingPayload, array(
+    'deliveryId' => 'delivery-legacy-pending-provable',
+    'occurredAt' => '2026-07-26T18:33:00Z',
+));
+$provableLegacyReplacementBody = json_encode($provableLegacyReplacement, JSON_THROW_ON_ERROR);
+$provableLegacyResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyPendingOrder,
+    'transaction-123',
+    $provableLegacyReplacement,
+    $provableLegacyReplacementBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('on-hold');
+    }
+);
+ipnAssertSame('applied', $provableLegacyResult, 'A legacy pending replacement may recover after exact-delivery identity backfill.');
+
+$legacyPendingContradiction = array_merge($provableLegacyReplacement, array(
+    'deliveryId' => 'delivery-legacy-pending-contradictory',
+    'status' => 2,
+));
+$legacyPendingContradictionBody = json_encode($legacyPendingContradiction, JSON_THROW_ON_ERROR);
+$legacyPendingContradictionResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyPendingOrder,
+    'transaction-123',
+    $legacyPendingContradiction,
+    $legacyPendingContradictionBody,
+    static function (): void {
+        throw new RuntimeException('A contradictory legacy replacement must not run an effect.');
+    }
+);
+ipnAssertSame('conflict', $legacyPendingContradictionResult, 'A legacy event contradiction must conflict after semantic identity backfill.');
+
 $legacyStateOrder = new FakeIPNOrder();
 $legacyStatePayload = v2Payload('delivery-legacy-state', 1, 1);
 $legacyStateBody = json_encode($legacyStatePayload, JSON_THROW_ON_ERROR);
