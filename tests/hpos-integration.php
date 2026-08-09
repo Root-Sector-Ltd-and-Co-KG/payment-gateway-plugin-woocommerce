@@ -57,14 +57,14 @@ try {
         $transactionId,
         $firstPayload,
         $firstBody,
-        function (WC_Order $effectOrder) use (&$effects, $orderId, $metaKey): void {
+        function (WC_Order $effectOrder) use (&$effects, $orderId, $metaKey, $transactionId): void {
             $persistedOrder = wc_get_order($orderId);
             hposAssert($persistedOrder instanceof WC_Order, 'The claim must be reloadable through WooCommerce CRUD.');
             $pendingState = $persistedOrder->get_meta($metaKey, true);
             hposAssertSame('pending', $pendingState['deliveries']['hpos-delivery-1-' . $orderId]['phase'] ?? null, 'The claim must be durable before the effect.');
             hposAssertSame(1, $pendingState['highestEventVersion'] ?? null, 'The durable claim must advance the event version.');
             $effects++;
-            $effectOrder->update_status('processing');
+            $effectOrder->payment_complete($transactionId);
         }
     );
     hposAssertSame('applied', $firstResult, 'The first delivery must apply.');
@@ -74,7 +74,50 @@ try {
     hposAssert($reloadedOrder instanceof WC_Order, 'The order must reload after the first delivery.');
     $appliedState = $reloadedOrder->get_meta($metaKey, true);
     hposAssertSame('applied', $appliedState['deliveries'][$firstPayload['deliveryId']]['phase'] ?? null, 'The applied marker must survive an HPOS reload.');
-    hposAssertSame('processing', $reloadedOrder->get_status(), 'The applied order effect must survive an HPOS reload.');
+    hposAssert($reloadedOrder->is_paid(), 'The applied payment effect must survive an HPOS reload.');
+    $paidStatus = $reloadedOrder->get_status();
+    hposAssertSame($transactionId, $reloadedOrder->get_transaction_id(), 'The paid gateway transaction must become the durable active payment attempt.');
+
+    $otherTransactionId = 'hpos-other-transaction-' . $orderId;
+    $otherMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key($otherTransactionId);
+    $lateOtherPayload = array_merge($firstPayload, array(
+        'deliveryId' => 'hpos-other-delivery-' . $orderId,
+        'id' => $otherTransactionId,
+        'status' => 2,
+    ));
+    $lateOtherBody = wp_json_encode($lateOtherPayload, JSON_THROW_ON_ERROR);
+    $lateOtherEffects = 0;
+    $lateOtherResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $reloadedOrder,
+        $otherTransactionId,
+        $lateOtherPayload,
+        $lateOtherBody,
+        static function (WC_Order $effectOrder) use (&$lateOtherEffects): void {
+            $lateOtherEffects++;
+            $effectOrder->update_status('failed');
+        }
+    );
+    hposAssertSame('applied', $lateOtherResult, 'A stale payment-attempt delivery must be durably acknowledged.');
+    hposAssertSame(0, $lateOtherEffects, 'A stale payment attempt must not run an order-level effect.');
+
+    $reloadedOrder = wc_get_order($orderId);
+    hposAssert($reloadedOrder instanceof WC_Order, 'The order must reload after a stale payment-attempt delivery.');
+    hposAssertSame($paidStatus, $reloadedOrder->get_status(), 'A late failure for another transaction must not regress the paid HPOS order.');
+    hposAssertSame($transactionId, $reloadedOrder->get_transaction_id(), 'A stale attempt must not replace the active HPOS transaction identity.');
+    $otherState = $reloadedOrder->get_meta($otherMetaKey, true);
+    hposAssertSame('applied', $otherState['deliveries'][$lateOtherPayload['deliveryId']]['phase'] ?? null, 'A suppressed stale attempt must retain an applied acknowledgement marker in HPOS.');
+
+    $lateOtherDuplicate = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $reloadedOrder,
+        $otherTransactionId,
+        $lateOtherPayload,
+        $lateOtherBody,
+        static function () use (&$lateOtherEffects): void {
+            $lateOtherEffects++;
+        }
+    );
+    hposAssertSame('duplicate', $lateOtherDuplicate, 'An acknowledgement-loss retry for a stale payment attempt must remain duplicate-safe in HPOS.');
+    hposAssertSame(0, $lateOtherEffects, 'A duplicate stale-attempt delivery must not run an effect.');
 
     $duplicateResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
         $reloadedOrder,

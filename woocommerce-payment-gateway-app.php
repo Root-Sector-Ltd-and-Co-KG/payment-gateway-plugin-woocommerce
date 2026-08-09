@@ -212,6 +212,7 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             }
             if ($event_version < $state['highestEventVersion']) {
                 $state['deliveries'][$delivery_id]['phase'] = 'superseded';
+                $state = self::trim_deliveries($state);
                 self::save_state($order, $meta_key, $state);
                 return 'outdated';
             }
@@ -225,10 +226,18 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
                 'bodyHash' => $body_hash,
                 'phase' => 'pending',
             );
+            $state = self::trim_deliveries($state);
             self::save_state($order, $meta_key, $state);
         }
 
-        $apply_effect($order, $payload);
+        WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+            $order,
+            $transaction_id,
+            static function ($effect_order) use ($apply_effect, $payload) {
+                $apply_effect($effect_order, $payload);
+            },
+            isset($payload['status']) && $payload['status'] === 1
+        );
 
         $state = self::load_state($order->get_meta($meta_key, true));
         if (!isset($state['deliveries'][$delivery_id])) {
@@ -273,7 +282,10 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
         while (count($state['deliveries']) > self::MAX_RETAINED_DELIVERIES) {
             $removed = false;
             foreach ($state['deliveries'] as $delivery_id => $delivery) {
-                if (isset($delivery['phase']) && $delivery['phase'] === 'applied') {
+                if (
+                    isset($delivery['phase'])
+                    && in_array($delivery['phase'], array('applied', 'superseded'), true)
+                ) {
                     unset($state['deliveries'][$delivery_id]);
                     $removed = true;
                     break;
@@ -284,6 +296,32 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             }
         }
         return $state;
+    }
+}
+
+final class WC_Payment_Gateway_App_IPN_Order_Attempt
+{
+    public static function apply($order, $transaction_id, callable $apply_effect, $establishes_paid_attempt = false)
+    {
+        $active_transaction_id = trim((string) $order->get_transaction_id());
+        if (
+            $active_transaction_id !== ''
+            && !hash_equals($active_transaction_id, (string) $transaction_id)
+            && (!$establishes_paid_attempt || $order->is_paid())
+        ) {
+            return 'stale_attempt';
+        }
+
+        $apply_effect($order);
+        return 'applied';
+    }
+}
+
+final class WC_Payment_Gateway_App_IPN_Order_Lock
+{
+    public static function name($order_id, $unused_transaction_id = '')
+    {
+        return 'mpg_ipn_' . hash('sha1', (string) $order_id);
     }
 }
 
@@ -941,67 +979,77 @@ function init_woocommerce_payment_gateway_app()
                 exit("Order not found");
             }
 
-            if ($verified_request['version'] === 2) {
-                $lock_name = $this->acquire_ipn_v2_lock($order->get_id(), $transaction_id);
-                if ($lock_name === '') {
-                    if ($this->debug) {
-                        $this->log->warning('Webhook delivery lock unavailable', $this->get_safe_gateway_context($parsed_request, array(
-                            'source' => 'woocommerce-payment-gateway-app',
-                            'delivery_id' => $parsed_request['deliveryId'],
-                        )));
+            $lock_name = $this->acquire_ipn_lock($order->get_id(), $transaction_id);
+            if ($lock_name === '') {
+                if ($this->debug) {
+                    $lock_context = array('source' => 'woocommerce-payment-gateway-app');
+                    if (isset($parsed_request['deliveryId']) && is_scalar($parsed_request['deliveryId'])) {
+                        $lock_context['delivery_id'] = (string) $parsed_request['deliveryId'];
                     }
-                    status_header(503);
-                    exit("Webhook temporarily unavailable");
+                    $this->log->warning('Webhook order lock unavailable', $this->get_safe_gateway_context($parsed_request, $lock_context));
                 }
-
-                $processing_result = '';
-                try {
-                    // Re-read through WooCommerce CRUD after taking the lock so HPOS and
-                    // posts-table stores both observe the latest delivery state.
-                    $order = wc_get_order($external_reference);
-                    if (!$order) {
-                        $processing_result = 'order_not_found';
-                    } else {
-                        $processing_result = WC_Payment_Gateway_App_IPN_V2_Processor::process(
-                            $order,
-                            $transaction_id,
-                            $parsed_request,
-                            $raw_body,
-                            function ($locked_order, array $event) use ($dispute_status, $transaction_id) {
-                                $this->apply_webhook_effect($locked_order, $event, $dispute_status, $transaction_id, true);
-                            }
-                        );
-                    }
-                } catch (Throwable $error) {
-                    if ($this->debug) {
-                        $this->log->error('Webhook delivery processing failed', $this->get_safe_gateway_context($parsed_request, array(
-                            'source' => 'woocommerce-payment-gateway-app',
-                            'delivery_id' => $parsed_request['deliveryId'],
-                            'error_type' => get_class($error),
-                        )));
-                    }
-                    $processing_result = 'temporary_failure';
-                } finally {
-                    $this->release_ipn_v2_lock($lock_name);
-                }
-
-                if ($processing_result === 'order_not_found') {
-                    status_header(404);
-                    exit("Order not found");
-                }
-                if ($processing_result === 'conflict') {
-                    status_header(409);
-                    exit("Delivery identity conflict");
-                }
-                if ($processing_result === 'temporary_failure') {
-                    status_header(503);
-                    exit("Webhook temporarily unavailable");
-                }
-                status_header(200);
-                exit("OK");
+                status_header(503);
+                exit("Webhook temporarily unavailable");
             }
 
-            $this->apply_webhook_effect($order, $parsed_request, $dispute_status, $transaction_id, false);
+            $processing_result = '';
+            try {
+                // Re-read through WooCommerce CRUD after taking the order-scoped lock so HPOS
+                // and posts-table stores both observe the latest payment-attempt state.
+                $order = wc_get_order($external_reference);
+                if (!$order) {
+                    $processing_result = 'order_not_found';
+                } elseif ($verified_request['version'] === 2) {
+                    $processing_result = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+                        $order,
+                        $transaction_id,
+                        $parsed_request,
+                        $raw_body,
+                        function ($locked_order, array $event) use ($dispute_status, $transaction_id) {
+                            $this->apply_webhook_effect($locked_order, $event, $dispute_status, $transaction_id, true);
+                        }
+                    );
+                } else {
+                    $processing_result = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+                        $order,
+                        $transaction_id,
+                        function ($locked_order) use ($parsed_request, $dispute_status, $transaction_id) {
+                            $this->apply_webhook_effect($locked_order, $parsed_request, $dispute_status, $transaction_id, false);
+                        },
+                        !$has_dispute_status
+                            && isset($parsed_request['status'])
+                            && is_numeric($parsed_request['status'])
+                            && (int) $parsed_request['status'] === 1
+                    );
+                }
+            } catch (Throwable $error) {
+                if ($this->debug) {
+                    $error_context = array(
+                        'source' => 'woocommerce-payment-gateway-app',
+                        'error_type' => get_class($error),
+                    );
+                    if (isset($parsed_request['deliveryId']) && is_scalar($parsed_request['deliveryId'])) {
+                        $error_context['delivery_id'] = (string) $parsed_request['deliveryId'];
+                    }
+                    $this->log->error('Webhook delivery processing failed', $this->get_safe_gateway_context($parsed_request, $error_context));
+                }
+                $processing_result = 'temporary_failure';
+            } finally {
+                $this->release_ipn_lock($lock_name);
+            }
+
+            if ($processing_result === 'order_not_found') {
+                status_header(404);
+                exit("Order not found");
+            }
+            if ($processing_result === 'conflict') {
+                status_header(409);
+                exit("Delivery identity conflict");
+            }
+            if ($processing_result === 'temporary_failure') {
+                status_header(503);
+                exit("Webhook temporarily unavailable");
+            }
             status_header(200);
             exit("OK");
         }
@@ -1062,19 +1110,19 @@ function init_woocommerce_payment_gateway_app()
             $order->update_status($status, $note);
         }
 
-        private function acquire_ipn_v2_lock($order_id, $transaction_id)
+        private function acquire_ipn_lock($order_id, $transaction_id)
         {
             global $wpdb;
             if (!is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
                 return '';
             }
-            $lock_name = 'mpg_ipn_v2_' . hash('sha1', (string) $order_id . '|' . (string) $transaction_id);
+            $lock_name = WC_Payment_Gateway_App_IPN_Order_Lock::name($order_id, $transaction_id);
             $query = $wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock_name, 5);
             $acquired = $wpdb->get_var($query);
             return (string) $acquired === '1' ? $lock_name : '';
         }
 
-        private function release_ipn_v2_lock($lock_name)
+        private function release_ipn_lock($lock_name)
         {
             global $wpdb;
             if ($lock_name === '' || !is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
