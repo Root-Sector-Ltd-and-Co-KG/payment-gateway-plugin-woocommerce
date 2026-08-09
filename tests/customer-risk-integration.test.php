@@ -41,9 +41,19 @@ class RiskTestOrder
     public function get_billing_email(): string { return 'buyer@example.test'; }
     public function get_cancel_order_url(): string { return 'https://shop.example.test/cancel'; }
     public function get_total(): float { return 12.34; }
+    public function get_id(): int { return 42; }
     public function update_status($status, $note = ''): void { $this->statuses[] = array($status, $note); }
     public function update_meta_data($key, $value): void { $this->meta[(string)$key] = $value; }
     public function save(): void { $this->saves++; }
+}
+
+class RiskTestWpdb
+{
+    public function prepare($query, ...$params): array { return array('query' => $query, 'params' => $params); }
+    public function get_var($prepared): string
+    {
+        return str_contains((string)($prepared['query'] ?? ''), 'GET_LOCK') ? '1' : '1';
+    }
 }
 
 function add_action(): void {}
@@ -63,6 +73,8 @@ function wp_remote_retrieve_response_code($response): int { return (int)$respons
 function wp_remote_retrieve_body($response): string { return (string)$response['body']; }
 function wc_add_notice($message, $type): void { $GLOBALS['gateway_notices'][] = array($type, $message); }
 function wc_get_order() { return $GLOBALS['gateway_order']; }
+
+$wpdb = new RiskTestWpdb();
 
 require dirname(__DIR__) . '/woocommerce-payment-gateway-app.php';
 init_woocommerce_payment_gateway_app();

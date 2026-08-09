@@ -7,11 +7,18 @@ define('ABSPATH', __DIR__);
 eval('namespace Automattic\\WooCommerce\\Utilities; final class FeaturesUtil { public static array $declarations = array(); public static function declare_compatibility($feature, $file, $compatible): void { self::$declarations[] = array($feature, $file, $compatible); } }');
 
 $ipnRegisteredActions = array();
+$ipnDurableOrders = array();
 
 function add_action($hook, $callback = null): void
 {
     global $ipnRegisteredActions;
     $ipnRegisteredActions[$hook][] = $callback;
+}
+
+function wc_get_order($order_id)
+{
+    global $ipnDurableOrders;
+    return $ipnDurableOrders[(int) $order_id] ?? false;
 }
 
 require dirname(__DIR__) . '/woocommerce-payment-gateway-app.php';
@@ -88,6 +95,17 @@ final class FakeIPNOrder
     public string $status = 'pending';
     public string $transactionId = '';
     private array $meta = array();
+    private int $id;
+
+    public function __construct(int $id = 42)
+    {
+        $this->id = $id;
+    }
+
+    public function get_id(): int
+    {
+        return $this->id;
+    }
 
     public function get_meta(string $key, bool $single = true)
     {
@@ -134,8 +152,33 @@ final class FakeIPNOrder
     }
 }
 
+final class FakeIPNWpdb
+{
+    public array $trace = array();
+
+    public function prepare(string $query, ...$params): array
+    {
+        return array('query' => $query, 'params' => $params);
+    }
+
+    public function get_var($prepared)
+    {
+        $query = is_array($prepared) ? (string) ($prepared['query'] ?? '') : (string) $prepared;
+        if (str_contains($query, 'GET_LOCK')) {
+            $this->trace[] = 'lock';
+            return '1';
+        }
+        if (str_contains($query, 'RELEASE_LOCK')) {
+            $this->trace[] = 'unlock';
+            return '1';
+        }
+        throw new RuntimeException('Unexpected database query in test.');
+    }
+}
+
 $secret = 'whsec_test_receiver_secret';
 $now = 1785088800;
+$wpdb = new FakeIPNWpdb();
 
 foreach ($ipnRegisteredActions['before_woocommerce_init'] ?? array() as $callback) {
     $callback();
@@ -297,6 +340,102 @@ $omittedAttemptResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
 );
 ipnAssertSame('applied', $omittedAttemptResult, 'An older signed sender that omits the additive field must remain compatible.');
 ipnAssertSame(1, $omittedAttemptEffectCount, 'The omitted-field compatibility path must retain existing behavior.');
+
+// Signed v1/v2 event A may pass initial admission before checkout B commits.
+// The shared order lock must reload B before any event A effect is attempted.
+$interleavedObservations = array();
+foreach (array('1', '2') as $interleavedVersion) {
+    $cachedAttemptA = new FakeIPNOrder(420 + (int) $interleavedVersion);
+    $cachedAttemptA->update_meta_data(WC_Payment_Gateway_App_Checkout_Attempt::META_KEY, 'session-attempt-a');
+    $durableAttempt = new FakeIPNOrder($cachedAttemptA->get_id());
+    $durableAttempt->update_meta_data(WC_Payment_Gateway_App_Checkout_Attempt::META_KEY, 'session-attempt-a');
+    $ipnDurableOrders[$durableAttempt->get_id()] = $durableAttempt;
+
+    $interleavedPayload = $interleavedVersion === '2'
+        ? v2Payload('delivery-interleaved-' . $interleavedVersion, 1, 1)
+        : array(
+            'id' => 'transaction-interleaved-v1',
+            'externalReference' => (string) $durableAttempt->get_id(),
+            'status' => 1,
+        );
+    $interleavedPayload['sessionPublicId'] = 'session-attempt-a';
+    $interleavedBody = json_encode($interleavedPayload, JSON_THROW_ON_ERROR);
+    $interleavedVerification = WC_Payment_Gateway_App_IPN_Request::verify(
+        $interleavedBody,
+        signedHeaders(
+            $interleavedBody,
+            $secret,
+            $now,
+            $interleavedVersion === '2' ? '2' : null,
+            $interleavedVersion === '2' ? $interleavedPayload['deliveryId'] : null
+        ),
+        $secret,
+        $now
+    );
+    ipnAssertSame(true, $interleavedVerification['ok'], 'The interleaved signed v' . $interleavedVersion . ' fixture must pass request admission.');
+    ipnAssertSame(
+        true,
+        WC_Payment_Gateway_App_Checkout_Attempt::matches_signed_event($cachedAttemptA, $interleavedVerification['payload']),
+        'Signed v' . $interleavedVersion . ' event A must initially match cached attempt A.'
+    );
+
+    $traceStart = count($wpdb->trace);
+    $attemptBPersistence = WC_Payment_Gateway_App_Checkout_Attempt::persist_from_checkout_response(
+        $durableAttempt,
+        array('sessionPublicId' => 'session-attempt-b')
+    );
+    ipnAssertSame('persisted', $attemptBPersistence, 'Checkout attempt B must persist between event A admission and effect.');
+
+    $interleavedEffects = 0;
+    $interleavedResult = method_exists(WC_Payment_Gateway_App_IPN_Order_Lock::class, 'synchronize')
+        ? WC_Payment_Gateway_App_IPN_Order_Lock::synchronize(
+            $cachedAttemptA,
+            static function ($lockedOrder) use ($interleavedVersion, $interleavedVerification, $interleavedBody, &$interleavedEffects) {
+                if ($interleavedVersion === '2') {
+                    return WC_Payment_Gateway_App_IPN_V2_Processor::process(
+                        $lockedOrder,
+                        (string) $interleavedVerification['payload']['id'],
+                        $interleavedVerification['payload'],
+                        $interleavedBody,
+                        static function () use (&$interleavedEffects): void {
+                            $interleavedEffects++;
+                        }
+                    );
+                }
+                return WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+                    $lockedOrder,
+                    (string) $interleavedVerification['payload']['id'],
+                    $interleavedVerification['payload'],
+                    static function () use (&$interleavedEffects): void {
+                        $interleavedEffects++;
+                    }
+                );
+            }
+        )
+        : 'missing_order_synchronization';
+
+    $interleavedObservations[$interleavedVersion] = array(
+        'result' => $interleavedResult,
+        'effects' => $interleavedEffects,
+        'lockTrace' => array_slice($wpdb->trace, $traceStart),
+    );
+}
+ipnAssertSame(
+    array(
+        '1' => array(
+            'result' => 'stale_attempt',
+            'effects' => 0,
+            'lockTrace' => array('lock', 'unlock', 'lock', 'unlock'),
+        ),
+        '2' => array(
+            'result' => 'applied',
+            'effects' => 0,
+            'lockTrace' => array('lock', 'unlock', 'lock', 'unlock'),
+        ),
+    ),
+    $interleavedObservations,
+    'Signed v1/v2 processing must reload durable attempt B while checkout persistence and effects use the same order lock.'
+);
 
 // Invalid payment statuses must be rejected before they can reserve durable event state.
 $statusIntegrityOrder = new FakeIPNOrder();

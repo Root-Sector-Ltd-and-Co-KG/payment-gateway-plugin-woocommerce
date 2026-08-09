@@ -201,9 +201,15 @@ final class WC_Payment_Gateway_App_Checkout_Attempt
         if (!self::valid_identifier($response_body['sessionPublicId'])) {
             return 'invalid';
         }
-        $order->update_meta_data(self::META_KEY, $response_body['sessionPublicId']);
-        $order->save();
-        return 'persisted';
+        $result = WC_Payment_Gateway_App_IPN_Order_Lock::synchronize(
+            $order,
+            static function ($locked_order) use ($response_body) {
+                $locked_order->update_meta_data(self::META_KEY, $response_body['sessionPublicId']);
+                $locked_order->save();
+                return 'persisted';
+            }
+        );
+        return $result === 'persisted' ? 'persisted' : 'unavailable';
     }
 
     public static function matches_signed_event($order, array $payload)
@@ -481,6 +487,38 @@ final class WC_Payment_Gateway_App_IPN_Order_Lock
     public static function name($order_id, $unused_transaction_id = '')
     {
         return 'mpg_ipn_' . hash('sha1', (string) $order_id);
+    }
+
+    public static function synchronize($order, callable $operation)
+    {
+        global $wpdb;
+        if (
+            !is_object($order)
+            || !method_exists($order, 'get_id')
+            || !is_object($wpdb)
+            || !method_exists($wpdb, 'prepare')
+            || !method_exists($wpdb, 'get_var')
+        ) {
+            return null;
+        }
+
+        $order_id = $order->get_id();
+        $lock_name = self::name($order_id);
+        $acquire_query = $wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock_name, 5);
+        if ((string) $wpdb->get_var($acquire_query) !== '1') {
+            return null;
+        }
+
+        try {
+            $locked_order = wc_get_order($order_id);
+            if (!$locked_order) {
+                return 'order_not_found';
+            }
+            return $operation($locked_order);
+        } finally {
+            $release_query = $wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name);
+            $wpdb->get_var($release_query);
+        }
     }
 }
 
@@ -1062,6 +1100,13 @@ function init_woocommerce_payment_gateway_app()
                         'redirect' => $cancelurl
                     );
                 }
+                if ($attempt_persistence === 'unavailable') {
+                    wc_add_notice(__('Payment session creation is temporarily unavailable. Please try again.', 'woo-payment-gateway-app'), 'error');
+                    return array(
+                        'result' => 'failure',
+                        'redirect' => $cancelurl
+                    );
+                }
                 return array(
                     'result' => 'success',
                     'redirect' => $response_body['paymentUrl']
@@ -1146,46 +1191,32 @@ function init_woocommerce_payment_gateway_app()
                 exit("Order not found");
             }
 
-            $lock_name = $this->acquire_ipn_lock($order->get_id(), $transaction_id);
-            if ($lock_name === '') {
-                if ($this->debug) {
-                    $lock_context = array('source' => 'woocommerce-payment-gateway-app');
-                    if (isset($parsed_request['deliveryId']) && is_scalar($parsed_request['deliveryId'])) {
-                        $lock_context['delivery_id'] = (string) $parsed_request['deliveryId'];
-                    }
-                    $this->log->warning('Webhook order lock unavailable', $this->get_safe_gateway_context($parsed_request, $lock_context));
-                }
-                status_header(503);
-                exit("Webhook temporarily unavailable");
-            }
-
-            $processing_result = '';
+            $processing_result = null;
             try {
-                // Re-read through WooCommerce CRUD after taking the order-scoped lock so HPOS
-                // and posts-table stores both observe the latest payment-attempt state.
-                $order = wc_get_order($external_reference);
-                if (!$order) {
-                    $processing_result = 'order_not_found';
-                } elseif ($verified_request['version'] === 2) {
-                    $processing_result = WC_Payment_Gateway_App_IPN_V2_Processor::process(
-                        $order,
-                        $transaction_id,
-                        $parsed_request,
-                        $raw_body,
-                        function ($locked_order, array $event) use ($dispute_status, $transaction_id) {
-                            $this->apply_webhook_effect($locked_order, $event, $dispute_status, $transaction_id, true);
+                $processing_result = WC_Payment_Gateway_App_IPN_Order_Lock::synchronize(
+                    $order,
+                    function ($locked_order) use ($verified_request, $transaction_id, $parsed_request, $raw_body, $dispute_status) {
+                        if ($verified_request['version'] === 2) {
+                            return WC_Payment_Gateway_App_IPN_V2_Processor::process(
+                                $locked_order,
+                                $transaction_id,
+                                $parsed_request,
+                                $raw_body,
+                                function ($effect_order, array $event) use ($dispute_status, $transaction_id) {
+                                    $this->apply_webhook_effect($effect_order, $event, $dispute_status, $transaction_id, true);
+                                }
+                            );
                         }
-                    );
-                } else {
-                    $processing_result = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
-                        $order,
-                        $transaction_id,
-                        $parsed_request,
-                        function ($locked_order) use ($parsed_request, $dispute_status, $transaction_id) {
-                            $this->apply_webhook_effect($locked_order, $parsed_request, $dispute_status, $transaction_id, false);
-                        }
-                    );
-                }
+                        return WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+                            $locked_order,
+                            $transaction_id,
+                            $parsed_request,
+                            function ($effect_order) use ($parsed_request, $dispute_status, $transaction_id) {
+                                $this->apply_webhook_effect($effect_order, $parsed_request, $dispute_status, $transaction_id, false);
+                            }
+                        );
+                    }
+                );
             } catch (Throwable $error) {
                 if ($this->debug) {
                     $error_context = array(
@@ -1198,8 +1229,18 @@ function init_woocommerce_payment_gateway_app()
                     $this->log->error('Webhook delivery processing failed', $this->get_safe_gateway_context($parsed_request, $error_context));
                 }
                 $processing_result = 'temporary_failure';
-            } finally {
-                $this->release_ipn_lock($lock_name);
+            }
+
+            if ($processing_result === null) {
+                if ($this->debug) {
+                    $lock_context = array('source' => 'woocommerce-payment-gateway-app');
+                    if (isset($parsed_request['deliveryId']) && is_scalar($parsed_request['deliveryId'])) {
+                        $lock_context['delivery_id'] = (string) $parsed_request['deliveryId'];
+                    }
+                    $this->log->warning('Webhook order lock unavailable', $this->get_safe_gateway_context($parsed_request, $lock_context));
+                }
+                status_header(503);
+                exit("Webhook temporarily unavailable");
             }
 
             if ($processing_result === 'order_not_found') {
@@ -1272,28 +1313,6 @@ function init_woocommerce_payment_gateway_app()
                 return;
             }
             $order->update_status($status, $note);
-        }
-
-        private function acquire_ipn_lock($order_id, $transaction_id)
-        {
-            global $wpdb;
-            if (!is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
-                return '';
-            }
-            $lock_name = WC_Payment_Gateway_App_IPN_Order_Lock::name($order_id, $transaction_id);
-            $query = $wpdb->prepare('SELECT GET_LOCK(%s, %d)', $lock_name, 5);
-            $acquired = $wpdb->get_var($query);
-            return (string) $acquired === '1' ? $lock_name : '';
-        }
-
-        private function release_ipn_lock($lock_name)
-        {
-            global $wpdb;
-            if ($lock_name === '' || !is_object($wpdb) || !method_exists($wpdb, 'prepare') || !method_exists($wpdb, 'get_var')) {
-                return;
-            }
-            $query = $wpdb->prepare('SELECT RELEASE_LOCK(%s)', $lock_name);
-            $wpdb->get_var($query);
         }
 
         /**
