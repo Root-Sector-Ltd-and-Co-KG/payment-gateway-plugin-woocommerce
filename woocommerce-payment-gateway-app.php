@@ -77,15 +77,15 @@ final class WC_Payment_Gateway_App_IPN_Request
         if (!isset($payload['schemaVersion']) || !is_int($payload['schemaVersion']) || $payload['schemaVersion'] !== 2) {
             return self::failure('invalid_schema_version');
         }
-        if (!isset($payload['deliveryId']) || !self::valid_identifier($payload['deliveryId'])) {
+        if (!isset($payload['deliveryId']) || !self::valid_delivery_id($payload['deliveryId'])) {
             return self::failure('invalid_delivery_id');
         }
 
-        $header_delivery_id = isset($headers['delivery_id']) ? trim((string) $headers['delivery_id']) : '';
-        if (!self::valid_identifier($header_delivery_id)) {
+        $header_delivery_id = $headers['delivery_id'] ?? null;
+        if (!self::valid_delivery_id($header_delivery_id)) {
             return self::failure('invalid_delivery_id');
         }
-        if (!hash_equals((string) $payload['deliveryId'], $header_delivery_id)) {
+        if (!hash_equals($payload['deliveryId'], $header_delivery_id)) {
             return self::failure('delivery_id_mismatch');
         }
         if (!isset($payload['eventVersion']) || !is_int($payload['eventVersion']) || $payload['eventVersion'] <= 0) {
@@ -116,12 +116,12 @@ final class WC_Payment_Gateway_App_IPN_Request
         return self::success(2, $payload);
     }
 
-    private static function valid_identifier($value)
+    private static function valid_delivery_id($value)
     {
         return is_string($value)
             && $value !== ''
             && strlen($value) <= self::MAX_DELIVERY_ID_LENGTH
-            && preg_match('/\A[A-Za-z0-9._:-]+\z/', $value) === 1;
+            && preg_match('/[\x00-\x1F\x7F]/', $value) !== 1;
     }
 
     private static function valid_payload_identity($value)

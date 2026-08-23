@@ -202,6 +202,59 @@ $verified = WC_Payment_Gateway_App_IPN_Request::verify($body, signedHeaders($bod
 ipnAssertSame(true, $verified['ok'], 'A correctly signed and versioned v2 IPN must be accepted.');
 ipnAssertSame(2, $verified['version'], 'The verified request must retain the negotiated IPN version.');
 
+$opaqueDeliveryId = 'opaque/delivery+id=2026';
+$opaquePayload = v2Payload($opaqueDeliveryId, 2);
+$opaqueBody = json_encode($opaquePayload, JSON_THROW_ON_ERROR);
+$opaqueVerified = WC_Payment_Gateway_App_IPN_Request::verify(
+    $opaqueBody,
+    signedHeaders($opaqueBody, $secret, $now, '2', $opaqueDeliveryId),
+    $secret,
+    $now
+);
+ipnAssertSame(true, $opaqueVerified['ok'], 'A v2 delivery ID is opaque and may contain printable punctuation.');
+
+$opaqueMismatch = WC_Payment_Gateway_App_IPN_Request::verify(
+    $opaqueBody,
+    signedHeaders($opaqueBody, $secret, $now, '2', 'opaque/delivery+id=2027'),
+    $secret,
+    $now
+);
+ipnAssertSame(false, $opaqueMismatch['ok'], 'Opaque delivery IDs must still match exactly across the signed body and header.');
+ipnAssertSame('delivery_id_mismatch', $opaqueMismatch['code'], 'An opaque delivery mismatch needs the stable identity error code.');
+
+$deliveryIdBoundaryCases = array(
+    'empty_body' => array('', ''),
+    'empty_header' => array('delivery-nonempty', ''),
+    'maximum_length' => array(str_repeat('/', 128), str_repeat('/', 128)),
+    'oversized' => array(str_repeat('/', 129), str_repeat('/', 129)),
+    'control_character' => array("delivery\nidentifier", "delivery\nidentifier"),
+);
+$deliveryIdBoundaryResults = array();
+foreach ($deliveryIdBoundaryCases as $case => $deliveryIds) {
+    $bodyDeliveryId = $deliveryIds[0];
+    $headerDeliveryId = $deliveryIds[1];
+    $candidate = v2Payload($bodyDeliveryId, 3);
+    $candidateBody = json_encode($candidate, JSON_THROW_ON_ERROR);
+    $result = WC_Payment_Gateway_App_IPN_Request::verify(
+        $candidateBody,
+        signedHeaders($candidateBody, $secret, $now, '2', $headerDeliveryId),
+        $secret,
+        $now
+    );
+    $deliveryIdBoundaryResults[$case] = array($result['ok'], $result['code'] ?? null);
+}
+ipnAssertSame(
+    array(
+        'empty_body' => array(false, 'invalid_delivery_id'),
+        'empty_header' => array(false, 'invalid_delivery_id'),
+        'maximum_length' => array(true, null),
+        'oversized' => array(false, 'invalid_delivery_id'),
+        'control_character' => array(false, 'invalid_delivery_id'),
+    ),
+    $deliveryIdBoundaryResults,
+    'Opaque delivery IDs must remain non-empty, control-free, and bounded to 128 bytes.'
+);
+
 $nonCanonicalCases = array(
     'alias_only_transaction' => (function (): array {
         $candidate = v2Payload('delivery-alias-transaction', 2);
