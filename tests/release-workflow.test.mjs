@@ -39,6 +39,14 @@ test("Woo PR validation fetches the pinned parent source", () => {
   assert.match(prWorkflow, /fetch-depth: 0/);
 });
 
+test("Woo publication fetches release-control history before validating its pinned source", () => {
+  const controlsCheckout = workflow.match(
+    /- name: Checkout release controls\n([\s\S]*?)(?=\n\s+- name:)/,
+  );
+  assert.ok(controlsCheckout, "release-controls checkout must exist");
+  assert.match(controlsCheckout[1], /fetch-depth: 0/);
+});
+
 test("Woo PR validation proves the checked-out source against authoritative HPOS", () => {
   const checkout = prWorkflow.indexOf("Checkout pull request source");
   const setupNode = prWorkflow.indexOf("Set up Node.js for HPOS");
