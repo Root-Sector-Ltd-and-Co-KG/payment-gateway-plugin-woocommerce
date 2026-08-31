@@ -1,0 +1,1329 @@
+<?php
+
+declare(strict_types=1);
+
+define('ABSPATH', __DIR__);
+
+eval('namespace Automattic\\WooCommerce\\Utilities; final class FeaturesUtil { public static array $declarations = array(); public static function declare_compatibility($feature, $file, $compatible): void { self::$declarations[] = array($feature, $file, $compatible); } }');
+
+$ipnRegisteredActions = array();
+$ipnDurableOrders = array();
+
+function add_action($hook, $callback = null): void
+{
+    global $ipnRegisteredActions;
+    $ipnRegisteredActions[$hook][] = $callback;
+}
+
+function wc_get_order($order_id)
+{
+    global $ipnDurableOrders;
+    return $ipnDurableOrders[(int) $order_id] ?? false;
+}
+
+require dirname(__DIR__) . '/woocommerce-payment-gateway-app.php';
+
+function ipnAssertSame($expected, $actual, string $message): void
+{
+    if ($expected !== $actual) {
+        fwrite(STDERR, $message . "\nExpected: " . var_export($expected, true) . "\nActual: " . var_export($actual, true) . "\n");
+        exit(1);
+    }
+}
+
+function ipnAssertTrue(bool $condition, string $message): void
+{
+    if (!$condition) {
+        fwrite(STDERR, $message . "\n");
+        exit(1);
+    }
+}
+
+function signedHeaders(string $body, string $secret, int $timestamp, ?string $version = null, ?string $deliveryId = null): array
+{
+    $headers = array(
+        'timestamp' => (string) $timestamp,
+        'signature' => hash_hmac('sha256', $timestamp . '.' . $body, $secret),
+    );
+    if ($version !== null) {
+        $headers['version'] = $version;
+    }
+    if ($deliveryId !== null) {
+        $headers['delivery_id'] = $deliveryId;
+    }
+    return $headers;
+}
+
+function v2Payload(string $deliveryId, int $eventVersion, $status = 1): array
+{
+    return array(
+        'schemaVersion' => 2,
+        'deliveryId' => $deliveryId,
+        'eventVersion' => $eventVersion,
+        'occurredAt' => '2026-07-26T18:30:00Z',
+        'id' => 'transaction-123',
+        'externalReference' => '42',
+        'status' => $status,
+    );
+}
+
+function preAttemptIdentityEffectHash(array $payload): string
+{
+    return hash('sha256', json_encode(
+        array(
+            'id' => isset($payload['id']) && is_scalar($payload['id']) ? (string) $payload['id'] : null,
+            'externalReference' => isset($payload['externalReference']) && is_scalar($payload['externalReference']) ? (string) $payload['externalReference'] : null,
+            'status' => array_key_exists('status', $payload) ? $payload['status'] : null,
+        ),
+        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRESERVE_ZERO_FRACTION | JSON_THROW_ON_ERROR
+    ));
+}
+
+function attemptPayload(string $attemptId, int $status): array
+{
+    return array(
+        'id' => 'transaction-' . $status,
+        'externalReference' => '42',
+        'sessionPublicId' => $attemptId,
+        'status' => $status,
+    );
+}
+
+final class FakeIPNOrder
+{
+    public array $trace = array();
+    public string $status = 'pending';
+    public string $transactionId = '';
+    private array $meta = array();
+    private int $id;
+
+    public function __construct(int $id = 42)
+    {
+        $this->id = $id;
+    }
+
+    public function get_id(): int
+    {
+        return $this->id;
+    }
+
+    public function get_meta(string $key, bool $single = true)
+    {
+        return $this->meta[$key] ?? '';
+    }
+
+    public function update_meta_data(string $key, $value): void
+    {
+        $this->meta[$key] = $value;
+    }
+
+    public function save(): void
+    {
+        $this->trace[] = 'save';
+    }
+
+    public function is_paid(): bool
+    {
+        return in_array($this->status, array('processing', 'completed'), true);
+    }
+
+    public function get_transaction_id(): string
+    {
+        return $this->transactionId;
+    }
+
+    public function set_transaction_id(string $transactionId): void
+    {
+        $this->transactionId = $transactionId;
+        $this->trace[] = 'bind:' . $transactionId;
+    }
+
+    public function payment_complete(string $transactionId): void
+    {
+        $this->transactionId = $transactionId;
+        $this->status = 'processing';
+        $this->trace[] = 'payment:' . $transactionId;
+    }
+
+    public function update_status(string $status): void
+    {
+        $this->status = $status;
+        $this->trace[] = 'status:' . $status;
+    }
+}
+
+final class FakeIPNWpdb
+{
+    public array $trace = array();
+
+    public function prepare(string $query, ...$params): array
+    {
+        return array('query' => $query, 'params' => $params);
+    }
+
+    public function get_var($prepared)
+    {
+        $query = is_array($prepared) ? (string) ($prepared['query'] ?? '') : (string) $prepared;
+        if (str_contains($query, 'GET_LOCK')) {
+            $this->trace[] = 'lock';
+            return '1';
+        }
+        if (str_contains($query, 'RELEASE_LOCK')) {
+            $this->trace[] = 'unlock';
+            return '1';
+        }
+        throw new RuntimeException('Unexpected database query in test.');
+    }
+}
+
+$secret = 'whsec_test_receiver_secret';
+$now = 1785088800;
+$wpdb = new FakeIPNWpdb();
+
+foreach ($ipnRegisteredActions['before_woocommerce_init'] ?? array() as $callback) {
+    $callback();
+}
+ipnAssertSame(
+    array(array('custom_order_tables', dirname(__DIR__) . '/woocommerce-payment-gateway-app.php', true)),
+    \Automattic\WooCommerce\Utilities\FeaturesUtil::$declarations,
+    'The plugin must declare HPOS compatibility through WooCommerce FeaturesUtil.'
+);
+
+// A missing version header remains the bounded v1 compatibility path.
+$v1Body = json_encode(array('id' => 'transaction-123', 'externalReference' => '42', 'status' => 1), JSON_THROW_ON_ERROR);
+$v1 = WC_Payment_Gateway_App_IPN_Request::verify($v1Body, signedHeaders($v1Body, $secret, $now), $secret, $now);
+ipnAssertSame(true, $v1['ok'], 'A correctly signed legacy IPN must remain accepted during the migration window.');
+ipnAssertSame(1, $v1['version'], 'A payload without version markers must use the legacy v1 path.');
+
+$deliveryId = 'delivery-123';
+$payload = v2Payload($deliveryId, 1);
+$body = json_encode($payload, JSON_THROW_ON_ERROR);
+$verified = WC_Payment_Gateway_App_IPN_Request::verify($body, signedHeaders($body, $secret, $now, '2', $deliveryId), $secret, $now);
+ipnAssertSame(true, $verified['ok'], 'A correctly signed and versioned v2 IPN must be accepted.');
+ipnAssertSame(2, $verified['version'], 'The verified request must retain the negotiated IPN version.');
+
+$opaqueDeliveryId = 'opaque/delivery+id=2026';
+$opaquePayload = v2Payload($opaqueDeliveryId, 2);
+$opaqueBody = json_encode($opaquePayload, JSON_THROW_ON_ERROR);
+$opaqueVerified = WC_Payment_Gateway_App_IPN_Request::verify(
+    $opaqueBody,
+    signedHeaders($opaqueBody, $secret, $now, '2', $opaqueDeliveryId),
+    $secret,
+    $now
+);
+ipnAssertSame(true, $opaqueVerified['ok'], 'A v2 delivery ID is opaque and may contain printable punctuation.');
+
+$opaqueMismatch = WC_Payment_Gateway_App_IPN_Request::verify(
+    $opaqueBody,
+    signedHeaders($opaqueBody, $secret, $now, '2', 'opaque/delivery+id=2027'),
+    $secret,
+    $now
+);
+ipnAssertSame(false, $opaqueMismatch['ok'], 'Opaque delivery IDs must still match exactly across the signed body and header.');
+ipnAssertSame('delivery_id_mismatch', $opaqueMismatch['code'], 'An opaque delivery mismatch needs the stable identity error code.');
+
+$deliveryIdBoundaryCases = array(
+    'empty_body' => array('', ''),
+    'empty_header' => array('delivery-nonempty', ''),
+    'maximum_length' => array(str_repeat('/', 128), str_repeat('/', 128)),
+    'oversized' => array(str_repeat('/', 129), str_repeat('/', 129)),
+    'control_character' => array("delivery\nidentifier", "delivery\nidentifier"),
+);
+$deliveryIdBoundaryResults = array();
+foreach ($deliveryIdBoundaryCases as $case => $deliveryIds) {
+    $bodyDeliveryId = $deliveryIds[0];
+    $headerDeliveryId = $deliveryIds[1];
+    $candidate = v2Payload($bodyDeliveryId, 3);
+    $candidateBody = json_encode($candidate, JSON_THROW_ON_ERROR);
+    $result = WC_Payment_Gateway_App_IPN_Request::verify(
+        $candidateBody,
+        signedHeaders($candidateBody, $secret, $now, '2', $headerDeliveryId),
+        $secret,
+        $now
+    );
+    $deliveryIdBoundaryResults[$case] = array($result['ok'], $result['code'] ?? null);
+}
+ipnAssertSame(
+    array(
+        'empty_body' => array(false, 'invalid_delivery_id'),
+        'empty_header' => array(false, 'invalid_delivery_id'),
+        'maximum_length' => array(true, null),
+        'oversized' => array(false, 'invalid_delivery_id'),
+        'control_character' => array(false, 'invalid_delivery_id'),
+    ),
+    $deliveryIdBoundaryResults,
+    'Opaque delivery IDs must remain non-empty, control-free, and bounded to 128 bytes.'
+);
+
+$nonCanonicalCases = array(
+    'alias_only_transaction' => (function (): array {
+        $candidate = v2Payload('delivery-alias-transaction', 2);
+        unset($candidate['id']);
+        $candidate['transactionId'] = 'transaction-123';
+        return $candidate;
+    })(),
+    'alias_only_external_reference' => (function (): array {
+        $candidate = v2Payload('delivery-alias-reference', 3);
+        unset($candidate['externalReference']);
+        $candidate['chargeback'] = array('externalReference' => '42');
+        return $candidate;
+    })(),
+    'hybrid_dispute_status' => (function (): array {
+        $candidate = v2Payload('delivery-hybrid', 4);
+        $candidate['status'] = 1;
+        $candidate['disputeStatus'] = 'lost';
+        return $candidate;
+    })(),
+    'typed_transaction' => (function (): array {
+        $candidate = v2Payload('delivery-typed-transaction', 5);
+        $candidate['id'] = 123;
+        return $candidate;
+    })(),
+    'typed_external_reference' => (function (): array {
+        $candidate = v2Payload('delivery-typed-reference', 6);
+        $candidate['externalReference'] = 42;
+        return $candidate;
+    })(),
+);
+$nonCanonicalResults = array();
+foreach ($nonCanonicalCases as $case => $candidate) {
+    $candidateBody = json_encode($candidate, JSON_THROW_ON_ERROR);
+    $result = WC_Payment_Gateway_App_IPN_Request::verify(
+        $candidateBody,
+        signedHeaders($candidateBody, $secret, $now, '2', $candidate['deliveryId']),
+        $secret,
+        $now
+    );
+    $nonCanonicalResults[$case] = array($result['ok'], $result['code'] ?? null);
+}
+ipnAssertSame(
+    array(
+        'alias_only_transaction' => array(false, 'legacy_alias_not_allowed'),
+        'alias_only_external_reference' => array(false, 'legacy_alias_not_allowed'),
+        'hybrid_dispute_status' => array(false, 'legacy_alias_not_allowed'),
+        'typed_transaction' => array(false, 'invalid_transaction_id'),
+        'typed_external_reference' => array(false, 'invalid_external_reference'),
+    ),
+    $nonCanonicalResults,
+    'IPN v2 must require canonical typed identity fields and reject legacy alias or hybrid payloads.'
+);
+
+$mismatched = WC_Payment_Gateway_App_IPN_Request::verify($body, signedHeaders($body, $secret, $now, '2', 'different-delivery'), $secret, $now);
+ipnAssertSame(false, $mismatched['ok'], 'A v2 delivery header/body mismatch must be rejected.');
+ipnAssertSame('delivery_id_mismatch', $mismatched['code'], 'A v2 delivery mismatch needs a stable non-sensitive error code.');
+
+$missingVersionHeader = WC_Payment_Gateway_App_IPN_Request::verify($body, signedHeaders($body, $secret, $now), $secret, $now);
+ipnAssertSame(false, $missingVersionHeader['ok'], 'A schema-v2 body must not silently downgrade to the v1 path.');
+ipnAssertSame('version_mismatch', $missingVersionHeader['code'], 'Missing v2 negotiation must be distinguishable from malformed JSON.');
+
+$invalidEvent = v2Payload('delivery-invalid', 0);
+$invalidEventBody = json_encode($invalidEvent, JSON_THROW_ON_ERROR);
+$invalidEventResult = WC_Payment_Gateway_App_IPN_Request::verify($invalidEventBody, signedHeaders($invalidEventBody, $secret, $now, '2', 'delivery-invalid'), $secret, $now);
+ipnAssertSame(false, $invalidEventResult['ok'], 'A non-positive event version must be rejected.');
+
+$invalidDate = v2Payload('delivery-date', 2);
+$invalidDate['occurredAt'] = '2026-02-30T18:30:00Z';
+$invalidDateBody = json_encode($invalidDate, JSON_THROW_ON_ERROR);
+$invalidDateResult = WC_Payment_Gateway_App_IPN_Request::verify($invalidDateBody, signedHeaders($invalidDateBody, $secret, $now, '2', 'delivery-date'), $secret, $now);
+ipnAssertSame(false, $invalidDateResult['ok'], 'An impossible occurredAt date must be rejected.');
+
+$invalidAttemptPayload = v2Payload('delivery-attempt-invalid', 2);
+$invalidAttemptPayload['sessionPublicId'] = str_repeat('a', 129);
+$invalidAttemptBody = json_encode($invalidAttemptPayload, JSON_THROW_ON_ERROR);
+$invalidAttemptResult = WC_Payment_Gateway_App_IPN_Request::verify(
+    $invalidAttemptBody,
+    signedHeaders($invalidAttemptBody, $secret, $now, '2', 'delivery-attempt-invalid'),
+    $secret,
+    $now
+);
+ipnAssertSame(false, $invalidAttemptResult['ok'], 'An oversized signed checkout-attempt identity must be rejected.');
+ipnAssertSame('invalid_session_public_id', $invalidAttemptResult['code'], 'Attempt-identity validation must use a fixed error code.');
+
+$invalidV1AttemptBody = json_encode(array(
+    'id' => 'transaction-invalid-v1-attempt',
+    'externalReference' => '42',
+    'sessionPublicId' => array('not' => 'scalar'),
+    'status' => 1,
+), JSON_THROW_ON_ERROR);
+$invalidV1AttemptResult = WC_Payment_Gateway_App_IPN_Request::verify(
+    $invalidV1AttemptBody,
+    signedHeaders($invalidV1AttemptBody, $secret, $now),
+    $secret,
+    $now
+);
+ipnAssertSame(false, $invalidV1AttemptResult['ok'], 'A malformed signed v1 checkout-attempt identity must also be rejected.');
+ipnAssertSame('invalid_session_public_id', $invalidV1AttemptResult['code'], 'V1 and v2 attempt validation must use the same fixed error code.');
+
+$currentAttemptOrder = new FakeIPNOrder();
+$currentAttemptOrder->update_meta_data(WC_Payment_Gateway_App_Checkout_Attempt::META_KEY, 'session-attempt-b');
+foreach (array(0, -2, 2, 1) as $staleStatus) {
+    $effectCount = 0;
+    $result = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+        $currentAttemptOrder,
+        'transaction-attempt-a-' . $staleStatus,
+        attemptPayload('session-attempt-a', $staleStatus),
+        static function () use (&$effectCount): void {
+            $effectCount++;
+        }
+    );
+    ipnAssertSame('stale_attempt', $result, 'A signed pending/cancel/fail/success event from attempt A must be acknowledged without changing attempt B.');
+    ipnAssertSame(0, $effectCount, 'A mismatched signed attempt identity must suppress every order effect.');
+}
+
+$currentAttemptEffectCount = 0;
+$currentAttemptResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $currentAttemptOrder,
+    'transaction-attempt-b',
+    attemptPayload('session-attempt-b', 1),
+    static function () use (&$currentAttemptEffectCount): void {
+        $currentAttemptEffectCount++;
+    }
+);
+ipnAssertSame('applied', $currentAttemptResult, 'A signed event for the persisted current attempt must still apply.');
+ipnAssertSame(1, $currentAttemptEffectCount, 'The current attempt must apply exactly one effect.');
+
+$omittedAttemptEffectCount = 0;
+$omittedAttemptResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $currentAttemptOrder,
+    'transaction-legacy',
+    array('id' => 'transaction-legacy', 'externalReference' => '42', 'status' => 0),
+    static function () use (&$omittedAttemptEffectCount): void {
+        $omittedAttemptEffectCount++;
+    }
+);
+ipnAssertSame('applied', $omittedAttemptResult, 'An older signed sender that omits the additive field must remain compatible.');
+ipnAssertSame(1, $omittedAttemptEffectCount, 'The omitted-field compatibility path must retain existing behavior.');
+
+// Signed v1/v2 event A may pass initial admission before checkout B commits.
+// The shared order lock must reload B before any event A effect is attempted.
+$interleavedObservations = array();
+foreach (array('1', '2') as $interleavedVersion) {
+    $cachedAttemptA = new FakeIPNOrder(420 + (int) $interleavedVersion);
+    $cachedAttemptA->update_meta_data(WC_Payment_Gateway_App_Checkout_Attempt::META_KEY, 'session-attempt-a');
+    $durableAttempt = new FakeIPNOrder($cachedAttemptA->get_id());
+    $durableAttempt->update_meta_data(WC_Payment_Gateway_App_Checkout_Attempt::META_KEY, 'session-attempt-a');
+    $ipnDurableOrders[$durableAttempt->get_id()] = $durableAttempt;
+
+    $interleavedPayload = $interleavedVersion === '2'
+        ? v2Payload('delivery-interleaved-' . $interleavedVersion, 1, 1)
+        : array(
+            'id' => 'transaction-interleaved-v1',
+            'externalReference' => (string) $durableAttempt->get_id(),
+            'status' => 1,
+        );
+    $interleavedPayload['sessionPublicId'] = 'session-attempt-a';
+    $interleavedBody = json_encode($interleavedPayload, JSON_THROW_ON_ERROR);
+    $interleavedVerification = WC_Payment_Gateway_App_IPN_Request::verify(
+        $interleavedBody,
+        signedHeaders(
+            $interleavedBody,
+            $secret,
+            $now,
+            $interleavedVersion === '2' ? '2' : null,
+            $interleavedVersion === '2' ? $interleavedPayload['deliveryId'] : null
+        ),
+        $secret,
+        $now
+    );
+    ipnAssertSame(true, $interleavedVerification['ok'], 'The interleaved signed v' . $interleavedVersion . ' fixture must pass request admission.');
+    ipnAssertSame(
+        true,
+        WC_Payment_Gateway_App_Checkout_Attempt::matches_signed_event($cachedAttemptA, $interleavedVerification['payload']),
+        'Signed v' . $interleavedVersion . ' event A must initially match cached attempt A.'
+    );
+
+    $traceStart = count($wpdb->trace);
+    $attemptBPersistence = WC_Payment_Gateway_App_Checkout_Attempt::persist_from_checkout_response(
+        $durableAttempt,
+        array('sessionPublicId' => 'session-attempt-b')
+    );
+    ipnAssertSame('persisted', $attemptBPersistence, 'Checkout attempt B must persist between event A admission and effect.');
+
+    $interleavedEffects = 0;
+    $interleavedResult = method_exists(WC_Payment_Gateway_App_IPN_Order_Lock::class, 'synchronize')
+        ? WC_Payment_Gateway_App_IPN_Order_Lock::synchronize(
+            $cachedAttemptA,
+            static function ($lockedOrder) use ($interleavedVersion, $interleavedVerification, $interleavedBody, &$interleavedEffects) {
+                if ($interleavedVersion === '2') {
+                    return WC_Payment_Gateway_App_IPN_V2_Processor::process(
+                        $lockedOrder,
+                        (string) $interleavedVerification['payload']['id'],
+                        $interleavedVerification['payload'],
+                        $interleavedBody,
+                        static function () use (&$interleavedEffects): void {
+                            $interleavedEffects++;
+                        }
+                    );
+                }
+                return WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+                    $lockedOrder,
+                    (string) $interleavedVerification['payload']['id'],
+                    $interleavedVerification['payload'],
+                    static function () use (&$interleavedEffects): void {
+                        $interleavedEffects++;
+                    }
+                );
+            }
+        )
+        : 'missing_order_synchronization';
+
+    $interleavedObservations[$interleavedVersion] = array(
+        'result' => $interleavedResult,
+        'effects' => $interleavedEffects,
+        'lockTrace' => array_slice($wpdb->trace, $traceStart),
+    );
+}
+ipnAssertSame(
+    array(
+        '1' => array(
+            'result' => 'stale_attempt',
+            'effects' => 0,
+            'lockTrace' => array('lock', 'unlock', 'lock', 'unlock'),
+        ),
+        '2' => array(
+            'result' => 'applied',
+            'effects' => 0,
+            'lockTrace' => array('lock', 'unlock', 'lock', 'unlock'),
+        ),
+    ),
+    $interleavedObservations,
+    'Signed v1/v2 processing must reload durable attempt B while checkout persistence and effects use the same order lock.'
+);
+
+// Invalid payment statuses must be rejected before they can reserve durable event state.
+$statusIntegrityOrder = new FakeIPNOrder();
+$statusIntegrityEffects = 0;
+$invalidStatusPayloads = array(
+    'fractional' => v2Payload('delivery-status-fractional', 10, 1.9),
+    'numeric_string' => v2Payload('delivery-status-numeric-string', 11, '1'),
+    'unsupported_integer' => v2Payload('delivery-status-unsupported', 12, 5),
+    'missing' => v2Payload('delivery-status-missing', 13),
+);
+unset($invalidStatusPayloads['missing']['status']);
+
+$statusRejections = array();
+foreach ($invalidStatusPayloads as $case => $invalidStatusPayload) {
+    $invalidStatusBody = json_encode($invalidStatusPayload, JSON_THROW_ON_ERROR);
+    $invalidStatusResult = WC_Payment_Gateway_App_IPN_Request::verify(
+        $invalidStatusBody,
+        signedHeaders($invalidStatusBody, $secret, $now, '2', $invalidStatusPayload['deliveryId']),
+        $secret,
+        $now
+    );
+    $statusRejections[$case] = array($invalidStatusResult['ok'], $invalidStatusResult['code'] ?? null);
+    if ($invalidStatusResult['ok']) {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $statusIntegrityOrder,
+            'transaction-status-integrity',
+            $invalidStatusResult['payload'],
+            $invalidStatusBody,
+            function () use (&$statusIntegrityEffects): void {
+                $statusIntegrityEffects++;
+            }
+        );
+    }
+}
+
+$validAfterInvalidPayload = v2Payload('delivery-status-valid', 1, 1);
+$validAfterInvalidBody = json_encode($validAfterInvalidPayload, JSON_THROW_ON_ERROR);
+$validAfterInvalidVerification = WC_Payment_Gateway_App_IPN_Request::verify(
+    $validAfterInvalidBody,
+    signedHeaders($validAfterInvalidBody, $secret, $now, '2', 'delivery-status-valid'),
+    $secret,
+    $now
+);
+$validAfterInvalidResult = $validAfterInvalidVerification['ok']
+    ? WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $statusIntegrityOrder,
+        'transaction-status-integrity',
+        $validAfterInvalidVerification['payload'],
+        $validAfterInvalidBody,
+        static function (): void {
+        }
+    )
+    : 'verification_failed';
+$statusIntegrityState = $statusIntegrityOrder->get_meta(
+    WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-status-integrity'),
+    true
+);
+
+ipnAssertSame(
+    array(
+        'rejections' => array(
+            'fractional' => array(false, 'invalid_status'),
+            'numeric_string' => array(false, 'invalid_status'),
+            'unsupported_integer' => array(false, 'invalid_status'),
+            'missing' => array(false, 'invalid_status'),
+        ),
+        'invalidEffects' => 0,
+        'validAfterResult' => 'applied',
+        'highestEventVersion' => 1,
+        'trace' => array('save', 'save'),
+    ),
+    array(
+        'rejections' => $statusRejections,
+        'invalidEffects' => $statusIntegrityEffects,
+        'validAfterResult' => $validAfterInvalidResult,
+        'highestEventVersion' => $statusIntegrityState['highestEventVersion'] ?? null,
+        'trace' => $statusIntegrityOrder->trace,
+    ),
+    'Invalid v2 payment statuses must not mutate effects, deduplication, or highest event version.'
+);
+
+// If the first acknowledgement is lost, a newly signed resend must not repeat effects.
+$order = new FakeIPNOrder();
+$effects = 0;
+$first = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $order,
+    'transaction-123',
+    $verified['payload'],
+    $body,
+    function (FakeIPNOrder $effectOrder) use (&$effects): void {
+        $effectOrder->trace[] = 'effect';
+        $effects++;
+    }
+);
+ipnAssertSame('applied', $first, 'The first delivery must apply its WooCommerce effect.');
+ipnAssertSame(array('save', 'effect', 'save'), $order->trace, 'The delivery marker must be saved before the non-idempotent WooCommerce effect.');
+
+$freshVerification = WC_Payment_Gateway_App_IPN_Request::verify($body, signedHeaders($body, $secret, $now + 1, '2', $deliveryId), $secret, $now + 1);
+ipnAssertSame(true, $freshVerification['ok'], 'The same body may be retried with a fresh signature timestamp.');
+$duplicate = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $order,
+    'transaction-123',
+    $freshVerification['payload'],
+    $body,
+    function () use (&$effects): void {
+        $effects++;
+    }
+);
+ipnAssertSame('duplicate', $duplicate, 'An already applied delivery must be acknowledged as a duplicate.');
+ipnAssertSame(1, $effects, 'A duplicate resend must not repeat WooCommerce effects.');
+
+// A later event wins even if an older delivery arrives afterwards.
+$orderedOrder = new FakeIPNOrder();
+$appliedStatuses = array();
+$newerPayload = v2Payload('delivery-newer', 2, 1);
+$newerBody = json_encode($newerPayload, JSON_THROW_ON_ERROR);
+$newerResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $orderedOrder,
+    'transaction-123',
+    $newerPayload,
+    $newerBody,
+    function (FakeIPNOrder $unused, array $event) use (&$appliedStatuses): void {
+        $appliedStatuses[] = $event['status'];
+    }
+);
+ipnAssertSame('applied', $newerResult, 'The newest transaction event must be applied.');
+
+$olderPayload = v2Payload('delivery-older', 1, 2);
+$olderBody = json_encode($olderPayload, JSON_THROW_ON_ERROR);
+$olderResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $orderedOrder,
+    'transaction-123',
+    $olderPayload,
+    $olderBody,
+    function (FakeIPNOrder $unused, array $event) use (&$appliedStatuses): void {
+        $appliedStatuses[] = $event['status'];
+    }
+);
+ipnAssertSame('outdated', $olderResult, 'An out-of-order event must be acknowledged without regressing the order.');
+ipnAssertSame(array(1), $appliedStatuses, 'The stale failed status must not run its WooCommerce effect.');
+
+// Order effects are bound to the payment attempt that actually paid the order.
+$attemptOrder = new FakeIPNOrder();
+$paymentB = v2Payload('delivery-attempt-b-payment', 1, 1);
+$paymentB['id'] = 'transaction-b';
+$paymentBBody = json_encode($paymentB, JSON_THROW_ON_ERROR);
+$paymentBResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $attemptOrder,
+    'transaction-b',
+    $paymentB,
+    $paymentBBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-b');
+    }
+);
+$lateFailureA = v2Payload('delivery-attempt-a-failed', 3, 2);
+$lateFailureA['id'] = 'transaction-a';
+$lateFailureABody = json_encode($lateFailureA, JSON_THROW_ON_ERROR);
+$lateFailureAResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $attemptOrder,
+    'transaction-a',
+    $lateFailureA,
+    $lateFailureABody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('failed');
+    }
+);
+$lateFailureADuplicate = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $attemptOrder,
+    'transaction-a',
+    $lateFailureA,
+    $lateFailureABody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('failed');
+    }
+);
+ipnAssertSame('applied', $paymentBResult, 'The successful checkout attempt must be applied.');
+ipnAssertSame('applied', $lateFailureAResult, 'A stale attempt event must be durably acknowledged without mutating the order.');
+ipnAssertSame('duplicate', $lateFailureADuplicate, 'An acknowledgement-loss retry for a stale attempt must be duplicate-safe.');
+ipnAssertSame('processing', $attemptOrder->status, 'A late failed event from transaction A must not regress an order paid by transaction B.');
+ipnAssertSame('transaction-b', $attemptOrder->transactionId, 'The paid transaction must remain the active payment attempt.');
+
+$refundB = v2Payload('delivery-attempt-b-refund', 2, 3);
+$refundB['id'] = 'transaction-b';
+$refundBBody = json_encode($refundB, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $attemptOrder,
+    'transaction-b',
+    $refundB,
+    $refundBBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('refunded');
+    }
+);
+$lateCancelA = v2Payload('delivery-attempt-a-cancelled', 4, -2);
+$lateCancelA['id'] = 'transaction-a';
+$lateCancelABody = json_encode($lateCancelA, JSON_THROW_ON_ERROR);
+$lateCancelAResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $attemptOrder,
+    'transaction-a',
+    $lateCancelA,
+    $lateCancelABody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('cancelled');
+    }
+);
+ipnAssertSame('applied', $lateCancelAResult, 'A stale attempt remains acknowledgeable after the active attempt is refunded.');
+ipnAssertSame('refunded', $attemptOrder->status, 'The active payment transaction binding must survive terminal order status changes.');
+ipnAssertSame('transaction-b', $attemptOrder->transactionId, 'Terminal order status changes must retain the active payment-attempt identity.');
+
+$lateSuccessA = v2Payload('delivery-attempt-a-success', 5, 1);
+$lateSuccessA['id'] = 'transaction-a';
+$lateSuccessABody = json_encode($lateSuccessA, JSON_THROW_ON_ERROR);
+$lateSuccessAResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $attemptOrder,
+    'transaction-a',
+    $lateSuccessA,
+    $lateSuccessABody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-a');
+    }
+);
+ipnAssertSame('applied', $lateSuccessAResult, 'A delayed success for a stale attempt must be durably acknowledged.');
+ipnAssertSame('refunded', $attemptOrder->status, 'A delayed transaction-A success must not reopen a transaction-B-refunded order.');
+ipnAssertSame('transaction-b', $attemptOrder->transactionId, 'A delayed transaction-A success must not rebind the refunded order.');
+
+// The same active-attempt invariant applies across the retained v1 and canonical v2 paths.
+$mixedOrder = new FakeIPNOrder();
+$legacyPayment = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $mixedOrder,
+    'transaction-v1-b',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v1-b');
+    }
+);
+$mixedV2Cancel = v2Payload('delivery-mixed-v2-cancel', 1, -2);
+$mixedV2Cancel['id'] = 'transaction-v2-a';
+$mixedV2CancelBody = json_encode($mixedV2Cancel, JSON_THROW_ON_ERROR);
+$mixedV2CancelResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $mixedOrder,
+    'transaction-v2-a',
+    $mixedV2Cancel,
+    $mixedV2CancelBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('cancelled');
+    }
+);
+$lateLegacyFailure = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $attemptOrder,
+    'transaction-v1-a',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('failed');
+    }
+);
+ipnAssertSame('applied', $legacyPayment, 'A signed v1 payment effect may establish the active paid transaction.');
+ipnAssertSame('applied', $mixedV2CancelResult, 'A canonical v2 stale-attempt event must still be acknowledged.');
+ipnAssertSame('stale_attempt', $lateLegacyFailure, 'A signed v1 stale-attempt effect must be suppressed after v2 payment.');
+ipnAssertSame('processing', $mixedOrder->status, 'A v2 cancellation from another transaction must not regress a v1-paid order.');
+ipnAssertSame('transaction-v1-b', $mixedOrder->transactionId, 'Mixed-protocol handling must preserve the active paid transaction.');
+ipnAssertSame('refunded', $attemptOrder->status, 'A v1 failure from another transaction must not regress the v2 payment attempt.');
+
+$v1PaidV2LateSuccessOrder = new FakeIPNOrder();
+WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $v1PaidV2LateSuccessOrder,
+    'transaction-v1-b',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v1-b');
+    }
+);
+WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $v1PaidV2LateSuccessOrder,
+    'transaction-v1-b',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('refunded');
+    }
+);
+$v2LateSuccess = v2Payload('delivery-mixed-v2-late-success', 1, 1);
+$v2LateSuccess['id'] = 'transaction-v2-a';
+$v2LateSuccessBody = json_encode($v2LateSuccess, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $v1PaidV2LateSuccessOrder,
+    'transaction-v2-a',
+    $v2LateSuccess,
+    $v2LateSuccessBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v2-a');
+    }
+);
+ipnAssertSame('refunded', $v1PaidV2LateSuccessOrder->status, 'A v2 delayed success must not reopen an order refunded by its v1 payment attempt.');
+ipnAssertSame('transaction-v1-b', $v1PaidV2LateSuccessOrder->transactionId, 'A v2 delayed success must not replace the retained v1 payment identity.');
+
+$v2PaidV1LateSuccessOrder = new FakeIPNOrder();
+$v2Payment = v2Payload('delivery-mixed-v2-payment', 1, 1);
+$v2Payment['id'] = 'transaction-v2-b';
+$v2PaymentBody = json_encode($v2Payment, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $v2PaidV1LateSuccessOrder,
+    'transaction-v2-b',
+    $v2Payment,
+    $v2PaymentBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v2-b');
+    }
+);
+$v2Refund = v2Payload('delivery-mixed-v2-refund', 2, 3);
+$v2Refund['id'] = 'transaction-v2-b';
+$v2RefundBody = json_encode($v2Refund, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $v2PaidV1LateSuccessOrder,
+    'transaction-v2-b',
+    $v2Refund,
+    $v2RefundBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('refunded');
+    }
+);
+$v1LateSuccessResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $v2PaidV1LateSuccessOrder,
+    'transaction-v1-a',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-v1-a');
+    }
+);
+ipnAssertSame('stale_attempt', $v1LateSuccessResult, 'A delayed v1 success for another transaction must be suppressed after a v2 refund.');
+ipnAssertSame('refunded', $v2PaidV1LateSuccessOrder->status, 'A v1 delayed success must not reopen an order refunded by its v2 payment attempt.');
+ipnAssertSame('transaction-v2-b', $v2PaidV1LateSuccessOrder->transactionId, 'A v1 delayed success must not replace the retained v2 payment identity.');
+
+$explicitReplacementOrder = new FakeIPNOrder();
+$explicitReplacementOrder->payment_complete('transaction-old');
+$explicitReplacementOrder->update_status('refunded');
+$explicitReplacementOrder->set_transaction_id('transaction-replacement');
+$explicitReplacementResult = WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+    $explicitReplacementOrder,
+    'transaction-replacement',
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->payment_complete('transaction-replacement');
+    }
+);
+ipnAssertSame('applied', $explicitReplacementResult, 'An explicitly rebound replacement payment attempt must remain processable.');
+ipnAssertSame('processing', $explicitReplacementOrder->status, 'An explicitly rebound replacement attempt may repay a refunded order.');
+ipnAssertSame('transaction-replacement', $explicitReplacementOrder->transactionId, 'Explicit replacement binding must remain authoritative.');
+
+// A replacement delivery may recover the same logical event after its first effect was interrupted.
+$replacementOrder = new FakeIPNOrder();
+$replacementPayload = v2Payload('delivery-replacement-original', 1, 0);
+$replacementBody = json_encode($replacementPayload, JSON_THROW_ON_ERROR);
+$replacementEffects = 0;
+try {
+    WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $replacementOrder,
+        'transaction-123',
+        $replacementPayload,
+        $replacementBody,
+        static function (FakeIPNOrder $effectOrder) use (&$replacementEffects): void {
+            if ($effectOrder->status !== 'on-hold') {
+                $replacementEffects++;
+                $effectOrder->update_status('on-hold');
+            }
+            throw new RuntimeException('simulated post-effect interruption');
+        }
+    );
+} catch (RuntimeException $error) {
+    ipnAssertSame('simulated post-effect interruption', $error->getMessage(), 'The simulated interruption must happen after the first effect.');
+}
+$equivalentReplacementPayload = array_merge($replacementPayload, array(
+    'deliveryId' => 'delivery-replacement-equivalent',
+    'occurredAt' => '2026-07-26T18:31:00Z',
+));
+$equivalentReplacementBody = json_encode($equivalentReplacementPayload, JSON_THROW_ON_ERROR);
+$equivalentReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $replacementOrder,
+    'transaction-123',
+    $equivalentReplacementPayload,
+    $equivalentReplacementBody,
+    static function (FakeIPNOrder $effectOrder) use (&$replacementEffects): void {
+        if ($effectOrder->status !== 'on-hold') {
+            $replacementEffects++;
+            $effectOrder->update_status('on-hold');
+        }
+    }
+);
+ipnAssertSame('applied', $equivalentReplacementResult, 'A different delivery ID with equivalent effect semantics must recover the pending event.');
+ipnAssertSame(1, $replacementEffects, 'Equivalent replacement recovery must not repeat an effect already made durable.');
+$replacementState = $replacementOrder->get_meta(
+    WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123'),
+    true
+);
+ipnAssertSame('superseded', $replacementState['deliveries'][$replacementPayload['deliveryId']]['phase'] ?? null, 'The interrupted delivery must become terminal after replacement recovery.');
+ipnAssertSame('applied', $replacementState['deliveries'][$equivalentReplacementPayload['deliveryId']]['phase'] ?? null, 'The equivalent replacement must retain the applied acknowledgement.');
+
+$contradictoryReplacementPayload = array_merge($equivalentReplacementPayload, array(
+    'deliveryId' => 'delivery-replacement-contradictory',
+    'status' => 2,
+));
+$contradictoryReplacementBody = json_encode($contradictoryReplacementPayload, JSON_THROW_ON_ERROR);
+$contradictoryReplacementEffects = 0;
+$contradictoryReplacementResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $replacementOrder,
+    'transaction-123',
+    $contradictoryReplacementPayload,
+    $contradictoryReplacementBody,
+    static function () use (&$contradictoryReplacementEffects): void {
+        $contradictoryReplacementEffects++;
+    }
+);
+ipnAssertSame('conflict', $contradictoryReplacementResult, 'A different delivery ID must not redefine the effect semantics of a transaction event version.');
+ipnAssertSame(0, $contradictoryReplacementEffects, 'A contradictory replacement must fail before running an effect.');
+
+// Persisted semantic identities written before sessionPublicId existed must remain
+// byte-for-byte compatible when an upgraded sender still omits the optional field.
+$preAttemptPendingOrder = new FakeIPNOrder();
+$preAttemptPendingPayload = v2Payload('delivery-pre-attempt-pending-original', 1, 0);
+$preAttemptPendingBody = json_encode($preAttemptPendingPayload, JSON_THROW_ON_ERROR);
+$preAttemptMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123');
+$preAttemptPendingOrder->update_meta_data($preAttemptMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $preAttemptPendingPayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $preAttemptPendingBody),
+            'phase' => 'pending',
+        ),
+    ),
+    'eventIdentities' => array('1' => preAttemptIdentityEffectHash($preAttemptPendingPayload)),
+));
+$preAttemptPendingRetry = array_merge($preAttemptPendingPayload, array(
+    'deliveryId' => 'delivery-pre-attempt-pending-retry',
+    'occurredAt' => '2026-07-26T18:31:30Z',
+));
+$preAttemptPendingRetryBody = json_encode($preAttemptPendingRetry, JSON_THROW_ON_ERROR);
+$preAttemptPendingEffects = 0;
+$preAttemptPendingResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $preAttemptPendingOrder,
+    'transaction-123',
+    $preAttemptPendingRetry,
+    $preAttemptPendingRetryBody,
+    static function () use (&$preAttemptPendingEffects): void {
+        $preAttemptPendingEffects++;
+    }
+);
+ipnAssertSame('applied', $preAttemptPendingResult, 'An omitted-field retry must recover pre-upgrade pending semantic state.');
+ipnAssertSame(1, $preAttemptPendingEffects, 'Pre-upgrade pending recovery must apply its effect exactly once.');
+
+$preAttemptAppliedOrder = new FakeIPNOrder();
+$preAttemptAppliedPayload = v2Payload('delivery-pre-attempt-applied-original', 1, 1);
+$preAttemptAppliedBody = json_encode($preAttemptAppliedPayload, JSON_THROW_ON_ERROR);
+$preAttemptAppliedOrder->update_meta_data($preAttemptMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $preAttemptAppliedPayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $preAttemptAppliedBody),
+            'phase' => 'applied',
+        ),
+    ),
+    'eventIdentities' => array('1' => preAttemptIdentityEffectHash($preAttemptAppliedPayload)),
+));
+$preAttemptAppliedRetry = array_merge($preAttemptAppliedPayload, array(
+    'deliveryId' => 'delivery-pre-attempt-applied-retry',
+    'occurredAt' => '2026-07-26T18:31:45Z',
+));
+$preAttemptAppliedRetryBody = json_encode($preAttemptAppliedRetry, JSON_THROW_ON_ERROR);
+$preAttemptAppliedResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $preAttemptAppliedOrder,
+    'transaction-123',
+    $preAttemptAppliedRetry,
+    $preAttemptAppliedRetryBody,
+    static function (): void {
+        throw new RuntimeException('A pre-upgrade acknowledgement-loss retry must not repeat the effect.');
+    }
+);
+ipnAssertSame('duplicate', $preAttemptAppliedResult, 'An omitted-field retry must dedupe pre-upgrade applied semantic state.');
+
+$legacyPendingOrder = new FakeIPNOrder();
+$legacyPendingPayload = v2Payload('delivery-legacy-pending-original', 1, 0);
+$legacyPendingBody = json_encode($legacyPendingPayload, JSON_THROW_ON_ERROR);
+$legacyPendingMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123');
+$legacyPendingOrder->update_meta_data($legacyPendingMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $legacyPendingPayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $legacyPendingBody),
+            'phase' => 'pending',
+        ),
+    ),
+));
+$unprovableLegacyReplacement = array_merge($legacyPendingPayload, array(
+    'deliveryId' => 'delivery-legacy-pending-unprovable',
+    'occurredAt' => '2026-07-26T18:32:00Z',
+));
+$unprovableLegacyReplacementBody = json_encode($unprovableLegacyReplacement, JSON_THROW_ON_ERROR);
+$unprovableLegacyEffects = 0;
+$unprovableLegacyResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyPendingOrder,
+    'transaction-123',
+    $unprovableLegacyReplacement,
+    $unprovableLegacyReplacementBody,
+    static function () use (&$unprovableLegacyEffects): void {
+        $unprovableLegacyEffects++;
+    }
+);
+ipnAssertSame('conflict', $unprovableLegacyResult, 'A different delivery ID must fail closed while legacy pending semantics are unprovable.');
+ipnAssertSame(0, $unprovableLegacyEffects, 'An unprovable legacy replacement must not run an effect.');
+
+try {
+    WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $legacyPendingOrder,
+        'transaction-123',
+        $legacyPendingPayload,
+        $legacyPendingBody,
+        static function (): void {
+            throw new RuntimeException('simulated legacy pending retry interruption');
+        }
+    );
+} catch (RuntimeException $error) {
+    ipnAssertSame('simulated legacy pending retry interruption', $error->getMessage(), 'The exact legacy pending retry must reach effect recovery.');
+}
+$backfilledLegacyPendingState = $legacyPendingOrder->get_meta($legacyPendingMetaKey, true);
+ipnAssertSame(1, count($backfilledLegacyPendingState['eventIdentities'] ?? array()), 'The exact legacy pending retry must durably backfill effect identity before recovery.');
+ipnAssertSame('pending', $backfilledLegacyPendingState['deliveries'][$legacyPendingPayload['deliveryId']]['phase'] ?? null, 'An interrupted exact legacy retry must remain recoverable.');
+
+$provableLegacyReplacement = array_merge($legacyPendingPayload, array(
+    'deliveryId' => 'delivery-legacy-pending-provable',
+    'occurredAt' => '2026-07-26T18:33:00Z',
+));
+$provableLegacyReplacementBody = json_encode($provableLegacyReplacement, JSON_THROW_ON_ERROR);
+$provableLegacyResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyPendingOrder,
+    'transaction-123',
+    $provableLegacyReplacement,
+    $provableLegacyReplacementBody,
+    static function (FakeIPNOrder $effectOrder): void {
+        $effectOrder->update_status('on-hold');
+    }
+);
+ipnAssertSame('applied', $provableLegacyResult, 'A legacy pending replacement may recover after exact-delivery identity backfill.');
+
+$legacyPendingContradiction = array_merge($provableLegacyReplacement, array(
+    'deliveryId' => 'delivery-legacy-pending-contradictory',
+    'status' => 2,
+));
+$legacyPendingContradictionBody = json_encode($legacyPendingContradiction, JSON_THROW_ON_ERROR);
+$legacyPendingContradictionResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyPendingOrder,
+    'transaction-123',
+    $legacyPendingContradiction,
+    $legacyPendingContradictionBody,
+    static function (): void {
+        throw new RuntimeException('A contradictory legacy replacement must not run an effect.');
+    }
+);
+ipnAssertSame('conflict', $legacyPendingContradictionResult, 'A legacy event contradiction must conflict after semantic identity backfill.');
+
+$legacyStateOrder = new FakeIPNOrder();
+$legacyStatePayload = v2Payload('delivery-legacy-state', 1, 1);
+$legacyStateBody = json_encode($legacyStatePayload, JSON_THROW_ON_ERROR);
+$legacyStateMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-123');
+$legacyStateOrder->update_meta_data($legacyStateMetaKey, array(
+    'formatVersion' => 1,
+    'highestEventVersion' => 1,
+    'deliveries' => array(
+        $legacyStatePayload['deliveryId'] => array(
+            'eventVersion' => 1,
+            'bodyHash' => hash('sha256', $legacyStateBody),
+            'phase' => 'applied',
+        ),
+    ),
+));
+$legacyStateResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $legacyStateOrder,
+    'transaction-123',
+    $legacyStatePayload,
+    $legacyStateBody,
+    static function (): void {
+        throw new RuntimeException('A legacy applied delivery must remain duplicate-safe.');
+    }
+);
+ipnAssertSame('duplicate', $legacyStateResult, 'Persisted format-v1 delivery state must remain readable and duplicate-safe.');
+$upgradedLegacyState = $legacyStateOrder->get_meta($legacyStateMetaKey, true);
+ipnAssertSame(1, count($upgradedLegacyState['eventIdentities'] ?? array()), 'An exact legacy-state retry must durably backfill its effect identity.');
+
+// A crash-pending event that is superseded remains safely acknowledgeable on every retry.
+$pendingOrder = new FakeIPNOrder();
+$pendingPayload = v2Payload('delivery-pending', 1, 0);
+$pendingBody = json_encode($pendingPayload, JSON_THROW_ON_ERROR);
+try {
+    WC_Payment_Gateway_App_IPN_V2_Processor::process(
+        $pendingOrder,
+        'transaction-pending',
+        $pendingPayload,
+        $pendingBody,
+        static function (): void {
+            throw new RuntimeException('simulated effect interruption');
+        }
+    );
+} catch (RuntimeException $error) {
+    ipnAssertSame('simulated effect interruption', $error->getMessage(), 'The simulated interruption must leave a pending marker.');
+}
+$supersedingPayload = v2Payload('delivery-superseding', 2, 1);
+$supersedingBody = json_encode($supersedingPayload, JSON_THROW_ON_ERROR);
+WC_Payment_Gateway_App_IPN_V2_Processor::process($pendingOrder, 'transaction-pending', $supersedingPayload, $supersedingBody, static function (): void {
+});
+$firstPendingRetry = WC_Payment_Gateway_App_IPN_V2_Processor::process($pendingOrder, 'transaction-pending', $pendingPayload, $pendingBody, static function (): void {
+});
+$secondPendingRetry = WC_Payment_Gateway_App_IPN_V2_Processor::process($pendingOrder, 'transaction-pending', $pendingPayload, $pendingBody, static function (): void {
+});
+ipnAssertSame('outdated', $firstPendingRetry, 'A pending event superseded by a newer version must not resume its old effect.');
+ipnAssertSame('outdated', $secondPendingRetry, 'Repeated retries of a superseded pending event must remain acknowledgeable.');
+
+// MIG-001: use valid signatures for both versions on the same transaction.
+$migrationOrder = new FakeIPNOrder();
+$migrationPaid = v2Payload('migration-paid', 2, 1);
+$migrationPaid['sessionPublicId'] = 'migration-session';
+$migrationBody = json_encode($migrationPaid, JSON_THROW_ON_ERROR);
+$migrationVerified = WC_Payment_Gateway_App_IPN_Request::verify($migrationBody, signedHeaders($migrationBody, $secret, $now, '2', 'migration-paid'), $secret, $now);
+ipnAssertSame(true, $migrationVerified['ok'], 'MIG-001 paid event must be signed and validated.');
+WC_Payment_Gateway_App_IPN_V2_Processor::process($migrationOrder, 'transaction-123', $migrationVerified['payload'], $migrationBody, static function ($order): void {
+    $order->payment_complete('transaction-123');
+});
+$migrationLegacy = array('id' => 'transaction-123', 'externalReference' => '42', 'sessionPublicId' => 'migration-session', 'status' => 2);
+$migrationLegacyBody = json_encode($migrationLegacy, JSON_THROW_ON_ERROR);
+$migrationLegacyVerified = WC_Payment_Gateway_App_IPN_Request::verify($migrationLegacyBody, signedHeaders($migrationLegacyBody, $secret, $now), $secret, $now);
+ipnAssertSame(true, $migrationLegacyVerified['ok'], 'MIG-001 stale legacy event must be validly signed.');
+$migrationLegacyResult = WC_Payment_Gateway_App_IPN_V1_Processor::process($migrationOrder, 'transaction-123', $migrationLegacyVerified['payload'], static function ($order): void {
+    $order->update_status('failed');
+});
+ipnAssertSame('processing', $migrationOrder->status, 'MIG-001: same-transaction v1 failure must not undo v2 payment.');
+
+ipnAssertSame('outdated', $migrationLegacyResult, 'A fenced legacy event must be acknowledged without effects.');
+$migrationRefund = array_merge($migrationPaid, array('deliveryId' => 'migration-refund', 'eventVersion' => 3, 'status' => 3));
+WC_Payment_Gateway_App_IPN_V2_Processor::process($migrationOrder, 'transaction-123', $migrationRefund, json_encode($migrationRefund, JSON_THROW_ON_ERROR), static function ($order): void {
+    $order->update_status('refunded');
+});
+ipnAssertSame('refunded', $migrationOrder->status, 'A newer v2 refund must still take effect after migration fencing.');
+$sessionFenceOrder = new FakeIPNOrder();
+$sessionPayload = array_merge($migrationPaid, array('status' => 0));
+WC_Payment_Gateway_App_IPN_V2_Processor::process($sessionFenceOrder, 'transaction-123', $sessionPayload, json_encode($sessionPayload, JSON_THROW_ON_ERROR), static function (): void {});
+$sessionLegacy = array('id' => 'legacy-other-id', 'externalReference' => '42', 'sessionPublicId' => 'migration-session', 'status' => 1);
+$sessionResult = WC_Payment_Gateway_App_IPN_V1_Processor::process($sessionFenceOrder, 'legacy-other-id', $sessionLegacy, static function ($order): void { $order->payment_complete('legacy-other-id'); });
+ipnAssertSame('outdated', $sessionResult, 'A v1 event cannot bypass a v2 session fence with another transaction ID.');
+$sessionLegacy['sessionPublicId'] = 'new-legacy-session';
+$sessionResult = WC_Payment_Gateway_App_IPN_V1_Processor::process($sessionFenceOrder, 'legacy-other-id', $sessionLegacy, static function ($order): void { $order->payment_complete('legacy-other-id'); });
+ipnAssertSame('applied', $sessionResult, 'A fresh distinct checkout may still use v1 after v2.');
+ipnAssertSame('processing', $sessionFenceOrder->status, 'The fresh legacy checkout must retain its payment effect.');
+
+// Unknown versions and a strictly typed v1 schema cannot enter legacy processing.
+foreach (array(3, 1.5, '1', null) as $unknownSchema) {
+    $unknownBody = json_encode(array('schemaVersion' => $unknownSchema, 'id' => 'transaction-123', 'externalReference' => '42', 'status' => 1), JSON_THROW_ON_ERROR);
+    $unknownResult = WC_Payment_Gateway_App_IPN_Request::verify($unknownBody, signedHeaders($unknownBody, $secret, $now, '1'), $secret, $now);
+    ipnAssertSame(false, $unknownResult['ok'], 'A legacy header cannot coerce an unknown schema into v1.');
+}
+
+// Readiness probes are signed v2 control messages, never synthetic payments.
+$probe = array('schemaVersion' => 2, 'eventType' => 'ipn.test', 'deliveryId' => 'probe/id+1', 'occurredAt' => '2026-08-31T18:00:00Z');
+$probeBody = json_encode($probe, JSON_THROW_ON_ERROR);
+$probeResult = WC_Payment_Gateway_App_IPN_Request::verify($probeBody, signedHeaders($probeBody, $secret, $now, '2', $probe['deliveryId']), $secret, $now);
+ipnAssertSame(true, $probeResult['ok'], 'A signed canonical readiness probe must be accepted without payment identity.');
+ipnAssertSame(array('schemaVersion' => 2, 'eventType' => 'ipn.test', 'deliveryId' => 'probe/id+1'), $probeResult['probeResponse'] ?? null, 'Readiness must return the exact signed delivery identity.');
+foreach (array(
+    array_merge($probe, array('status' => 1)),
+    array_merge($probe, array('id' => 'transaction-123')),
+    array_merge($probe, array('externalReference' => '42')),
+    array_merge($probe, array('sessionPublicId' => 'migration-session')),
+    array_merge($probe, array('eventVersion' => 1)),
+    array_merge($probe, array('eventType' => 'ipn.future')),
+    array_merge($probe, array('occurredAt' => 'invalid')),
+) as $malformedProbe) {
+    $malformedBody = json_encode($malformedProbe, JSON_THROW_ON_ERROR);
+    $malformedResult = WC_Payment_Gateway_App_IPN_Request::verify($malformedBody, signedHeaders($malformedBody, $secret, $now, '2', $probe['deliveryId']), $secret, $now);
+    ipnAssertSame(false, $malformedResult['ok'], 'Malformed or hybrid readiness messages must not be accepted.');
+}
+foreach (array('bad-signature', 'wrong-delivery', 'unknown-version', 'missing-version') as $probeFailure) {
+    $probeHeaders = signedHeaders($probeBody, $secret, $now, '2', $probe['deliveryId']);
+    if ($probeFailure === 'bad-signature') { $probeHeaders['signature'] = str_repeat('0', 64); }
+    if ($probeFailure === 'wrong-delivery') { $probeHeaders['delivery_id'] = 'wrong'; }
+    if ($probeFailure === 'unknown-version') { $probeHeaders['version'] = '3'; }
+    if ($probeFailure === 'missing-version') { unset($probeHeaders['version']); }
+    $invalidProbe = WC_Payment_Gateway_App_IPN_Request::verify($probeBody, $probeHeaders, $secret, $now);
+    ipnAssertSame(false, $invalidProbe['ok'], 'Probe admission must reject ' . $probeFailure . '.');
+}
+
+// Bounded delivery retention is safe because the monotonic version rejects replay.
+$retentionOrder = new FakeIPNOrder();
+for ($version = 1; $version <= 101; $version++) {
+    $retainedPayload = v2Payload('delivery-retained-' . $version, $version);
+    $retainedBody = json_encode($retainedPayload, JSON_THROW_ON_ERROR);
+    WC_Payment_Gateway_App_IPN_V2_Processor::process($retentionOrder, 'transaction-retained', $retainedPayload, $retainedBody, static function (): void {
+    });
+}
+$retentionKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-retained');
+$retainedState = $retentionOrder->get_meta($retentionKey, true);
+ipnAssertSame(100, count($retainedState['deliveries']), 'Processed delivery identity retention must remain bounded.');
+ipnAssertSame(100, count($retainedState['eventIdentities'] ?? array()), 'Effect-relevant event identity retention must remain bounded with delivery state.');
+
+$replayPayload = v2Payload('delivery-retained-1', 1, 2);
+$replayBody = json_encode($replayPayload, JSON_THROW_ON_ERROR);
+$replayEffects = 0;
+$replayResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+    $retentionOrder,
+    'transaction-retained',
+    $replayPayload,
+    $replayBody,
+    function () use (&$replayEffects): void {
+        $replayEffects++;
+    }
+);
+ipnAssertSame('outdated', $replayResult, 'An evicted old delivery ID must still be rejected by event version.');
+ipnAssertSame(0, $replayEffects, 'Retention expiry must not permit old effects to replay.');
+
+// Superseded terminal records are evictable, while the latest recoverable claim is retained.
+$supersededRetentionOrder = new FakeIPNOrder();
+$pendingPayloads = array();
+$pendingBodies = array();
+for ($version = 1; $version <= 105; $version++) {
+    $pendingPayloads[$version] = v2Payload('delivery-superseded-' . $version, $version, 0);
+    $pendingBodies[$version] = json_encode($pendingPayloads[$version], JSON_THROW_ON_ERROR);
+    try {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $supersededRetentionOrder,
+            'transaction-superseded-retention',
+            $pendingPayloads[$version],
+            $pendingBodies[$version],
+            static function (): void {
+                throw new RuntimeException('simulated pending effect interruption');
+            }
+        );
+    } catch (RuntimeException $error) {
+        ipnAssertSame('simulated pending effect interruption', $error->getMessage(), 'The newest delivery must remain pending for recovery.');
+    }
+    if ($version > 1) {
+        $supersededResult = WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $supersededRetentionOrder,
+            'transaction-superseded-retention',
+            $pendingPayloads[$version - 1],
+            $pendingBodies[$version - 1],
+            static function (): void {
+                throw new RuntimeException('A superseded event must not resume its effect.');
+            }
+        );
+        ipnAssertSame('outdated', $supersededResult, 'Each older pending delivery must become safely superseded.');
+    }
+}
+$supersededRetentionState = $supersededRetentionOrder->get_meta(
+    WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-superseded-retention'),
+    true
+);
+ipnAssertTrue(
+    count($supersededRetentionState['deliveries']) <= WC_Payment_Gateway_App_IPN_V2_Processor::MAX_RETAINED_DELIVERIES,
+    'Terminal delivery retention must remain bounded when records are superseded rather than applied.'
+);
+ipnAssertSame(
+    'pending',
+    $supersededRetentionState['deliveries']['delivery-superseded-105']['phase'] ?? null,
+    'Retention must not discard the latest recoverable pending delivery.'
+);
+
+// Newer event claims proactively supersede older pending work without requiring an old-delivery retry.
+$noRetryRetentionOrder = new FakeIPNOrder();
+for ($version = 1; $version <= 105; $version++) {
+    $noRetryPayload = v2Payload('delivery-no-retry-' . $version, $version, 0);
+    $noRetryBody = json_encode($noRetryPayload, JSON_THROW_ON_ERROR);
+    try {
+        WC_Payment_Gateway_App_IPN_V2_Processor::process(
+            $noRetryRetentionOrder,
+            'transaction-no-retry-retention',
+            $noRetryPayload,
+            $noRetryBody,
+            static function (): void {
+                throw new RuntimeException('simulated pending effect interruption');
+            }
+        );
+    } catch (RuntimeException $error) {
+        ipnAssertSame('simulated pending effect interruption', $error->getMessage(), 'Each interrupted newer event must preserve its recoverable claim.');
+    }
+}
+$noRetryRetentionState = $noRetryRetentionOrder->get_meta(
+    WC_Payment_Gateway_App_IPN_V2_Processor::meta_key('transaction-no-retry-retention'),
+    true
+);
+$recoverableDeliveryIds = array();
+foreach ($noRetryRetentionState['deliveries'] as $retainedDeliveryId => $delivery) {
+    if (($delivery['phase'] ?? null) === 'pending') {
+        $recoverableDeliveryIds[] = $retainedDeliveryId;
+    }
+}
+ipnAssertTrue(
+    count($noRetryRetentionState['deliveries']) <= WC_Payment_Gateway_App_IPN_V2_Processor::MAX_RETAINED_DELIVERIES,
+    'Newer failed effects must not leave terminally superseded pending claims beyond the retention bound.'
+);
+ipnAssertSame(
+    array('delivery-no-retry-105'),
+    $recoverableDeliveryIds,
+    'Only the newest interrupted delivery may remain recoverable without retrying older deliveries.'
+);
+
+ipnAssertSame(
+    WC_Payment_Gateway_App_IPN_Order_Lock::name(42, 'transaction-a'),
+    WC_Payment_Gateway_App_IPN_Order_Lock::name(42, 'transaction-b'),
+    'All payment attempts for one order must serialize on one order-scoped lock identity.'
+);
+
+// Reusing an existing identity for different signed content is a contract conflict.
+$collisionPayload = v2Payload($deliveryId, 1, 2);
+$collisionBody = json_encode($collisionPayload, JSON_THROW_ON_ERROR);
+$collision = WC_Payment_Gateway_App_IPN_V2_Processor::process($order, 'transaction-123', $collisionPayload, $collisionBody, static function (): void {
+});
+ipnAssertSame('conflict', $collision, 'A delivery ID reused for different content must not be applied or acknowledged as the original event.');
+
+ipnAssertTrue(!str_contains(serialize($retainedState), $retainedBody), 'Persistent deduplication state must not retain raw webhook payloads.');
+
+// Exercise the real terminating HTTP handler, including dispatch before order lookup.
+foreach (array('probe', 'bad-signature', 'wrong-delivery', 'unknown-version', 'hybrid', 'migration') as $httpCase) {
+    $process = proc_open(array(PHP_BINARY, __DIR__ . '/fixtures/ipn-http-driver.php', $httpCase), array(1 => array('pipe', 'w'), 2 => array('pipe', 'w')), $pipes);
+    $output = stream_get_contents($pipes[1]);
+    $errors = stream_get_contents($pipes[2]);
+    fclose($pipes[1]); fclose($pipes[2]);
+    ipnAssertSame(0, proc_close($process), 'The HTTP driver must exit normally: ' . $httpCase);
+    ipnAssertSame('', $errors, 'The HTTP driver must emit no warnings: ' . $httpCase);
+    $http = json_decode($output, true, 512, JSON_THROW_ON_ERROR);
+    ipnAssertSame($httpCase === 'probe' || $httpCase === 'migration' ? 200 : 400, $http['httpStatus'], 'HTTP admission must return the correct status: ' . $httpCase);
+    ipnAssertSame(true, $http['unchangedMetadata'], 'Probe and stale legacy HTTP requests must not persist state.');
+    if ($httpCase === 'migration') {
+        ipnAssertSame('OK', $http['body'], 'A stale legacy delivery must be acknowledged by the HTTP dispatcher.');
+        ipnAssertSame('processing', $http['status'], 'HTTP v1 dispatch must not undo a v2 payment.');
+    } else {
+        ipnAssertSame(0, $http['lookups'], 'A probe must not look up an order.');
+        ipnAssertSame('pending', $http['status'], 'A probe must not affect payments.');
+    }
+    if ($httpCase === 'probe') {
+        ipnAssertSame(array('schemaVersion' => 2, 'eventType' => 'ipn.test', 'deliveryId' => 'http-probe/id'), json_decode($http['body'], true, 512, JSON_THROW_ON_ERROR), 'HTTP readiness response must identify the signed probe.');
+    }
+}
+
+echo "WooCommerce IPN v2 receiver contract: PASS\n";

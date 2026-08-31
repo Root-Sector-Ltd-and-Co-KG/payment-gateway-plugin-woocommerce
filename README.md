@@ -59,13 +59,64 @@ The plugin registers a webhook endpoint automatically at:
 `[YOUR-SITE]/wc-api/wc_payment_gateway_app`
 
 When a transaction status changes, Payment Gateway App sends a POST
-request to this URL. Each request includes two signature headers:
+request to this URL. Every request includes two signature headers:
 
 - `X-Signature-Timestamp` - Unix timestamp (seconds) of when the request was signed
 - `X-Signature-HMAC-SHA256` - HMAC-SHA256 hex digest of `{timestamp}.{body}` using your Webhook Signing Secret
 
 The plugin verifies both headers before processing. If verification
 fails the request is rejected and logged (when Debug Log is enabled).
+
+IPN v2 additionally requires `X-IPN-Version: 2` and
+`X-IPN-Delivery-ID`. The signed JSON body carries the same `deliveryId`,
+`schemaVersion: 2`, a transaction-scoped monotonic `eventVersion`, and an
+RFC 3339 `occurredAt` timestamp. The plugin rejects inconsistent v2 metadata,
+stores only bounded delivery identifiers and body hashes through WooCommerce
+order CRUD, acknowledges duplicate or older events without repeating their
+effects, and prevents a late status from replacing a newer transaction state.
+This storage path remains compatible with WooCommerce HPOS.
+
+Existing or unversioned gateway sites remain v1; newly created sites default
+to v2. Upgrade this plugin before explicitly selecting v2 for the site. The
+gateway sends one selected format, with no automatic negotiation or dual-send.
+Do not downgrade to a plugin that predates v2 support.
+
+Legacy v1 remains supported through **2027-06-30**, with no date-only shutdown.
+Keep the old destination URL and signing configuration available for existing
+deliveries and manual retries until migration is complete. After a transaction
+or signed checkout session accepts v2, v1 notifications for the same identity
+are acknowledged without effects. A site rollback to v1 therefore applies to
+fresh checkouts; existing v2 transactions, refunds and replays must remain v2.
+
+Order metadata retains transaction watermarks and accepted session identities
+for the order lifetime. At most 100 recent delivery records are retained per
+transaction, with the latest recoverable effect protected. Removing old history
+does not reset ordering or allow a stale manual replay. All persistence uses
+WooCommerce CRUD, including HPOS, under the same order lock as checkout identity
+updates. Never clear receiver metadata to force a replay.
+
+The signed v2 readiness probe contains exactly `schemaVersion: 2`,
+`eventType: "ipn.test"`, `deliveryId`, and `occurredAt`, with normal HMAC headers
+and a matching `X-IPN-Delivery-ID`. The endpoint returns HTTP 200 JSON containing
+`schemaVersion: 2`, `eventType: "ipn.test"`, and the same delivery ID before any
+order lookup or payment effect. Hybrid payment/probe messages are rejected.
+This is an informative test action, not version negotiation or a payment test.
+
+=== Maintenance and v1 removal (PG-242) ===
+
+Payments-platform owns the temporary legacy adapter. PG-242 removes it after
+legacy sites, queued deliveries and manual-replay obligations are migrated;
+the support date alone is not sufficient. Delete `WC_Payment_Gateway_App_IPN_V1_Processor`,
+v1 branches in `WC_Payment_Gateway_App_IPN_Request::verify`, legacy identity and
+dispute parsing, and v1 compatibility cases in receiver/customer-risk tests.
+Keep the order lock, checkout identity protection, v2 processor metadata and
+all v2 ordering, partial-effect, readiness and HPOS tests. Preserve existing
+orders' durable protection across plugin upgrades.
+
+A later supported wire version requires an explicit validated dispatch branch
+and a narrow adapter that reuses order synchronization and effect protection.
+Define its ordering transition explicitly and reject unknown versions. Do not
+fabricate v2 envelopes for legacy traffic or add a generic version registry.
 
 If you suspect your Webhook Signing Secret has been compromised,
 regenerate it in Payment Gateway App admin -> Sites -> Edit and update
@@ -129,7 +180,23 @@ gateway request ID when available. Final merchant-loss customer risk holds use
 `CHECKOUT_RESTRICTED_BY_CUSTOMER_HOLD` asks the customer to choose an available
 bank-transfer option such as wire or Wise.
 
+== Upgrade Notice ==
+
+= 1.2.0 =
+
+Adds the IPN v2 receiver required for durable 48-hour delivery retries. Install
+this plugin version before opting a WooCommerce site into IPN v2. Existing v1
+sites continue working during the bounded migration window; no automatic
+downgrade from v2 is supported.
+
 == Changelog ==
+
+= 1.2.0 =
+
+- Enhancement: Add signed IPN v2 contract validation and stable delivery identity checks.
+- Reliability: Durably acknowledge duplicate and out-of-order transaction events without repeating WooCommerce effects.
+- Compatibility: Persist receiver state through WooCommerce order CRUD for HPOS and legacy order storage.
+- Migration: Retain v1 handling for the announced migration window and document the required v2 opt-in order.
 
 = 1.1.1 =
 
