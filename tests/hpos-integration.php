@@ -110,6 +110,19 @@ try {
     $paidStatus = $reloadedOrder->get_status();
     hposAssertSame($transactionId, $reloadedOrder->get_transaction_id(), 'The paid gateway transaction must become the durable active payment attempt.');
 
+    // MIG-001: the v1 adapter must consult durable v2 state after an HPOS reload.
+    $legacySameTransaction = array('id' => $transactionId, 'externalReference' => (string)$orderId, 'sessionPublicId' => $firstPayload['sessionPublicId'], 'status' => 2);
+    $legacyMigrationResult = WC_Payment_Gateway_App_IPN_Order_Lock::synchronize(
+        $reloadedOrder,
+        static function (WC_Order $lockedOrder) use ($transactionId, $legacySameTransaction) {
+            return WC_Payment_Gateway_App_IPN_V1_Processor::process($lockedOrder, $transactionId, $legacySameTransaction, static function (WC_Order $effectOrder): void {
+                $effectOrder->update_status('failed');
+            });
+        }
+    );
+    hposAssertSame('outdated', $legacyMigrationResult, 'A v1 downgrade must be acknowledged without effects using HPOS metadata.');
+    hposAssertSame($paidStatus, wc_get_order($orderId)->get_status(), 'A signed legacy failure must not undo a v2 HPOS payment.');
+
     $otherTransactionId = 'hpos-other-transaction-' . $orderId;
     $otherMetaKey = WC_Payment_Gateway_App_IPN_V2_Processor::meta_key($otherTransactionId);
     $lateOtherPayload = array_merge($firstPayload, array(

@@ -1102,6 +1102,78 @@ $secondPendingRetry = WC_Payment_Gateway_App_IPN_V2_Processor::process($pendingO
 ipnAssertSame('outdated', $firstPendingRetry, 'A pending event superseded by a newer version must not resume its old effect.');
 ipnAssertSame('outdated', $secondPendingRetry, 'Repeated retries of a superseded pending event must remain acknowledgeable.');
 
+// MIG-001: use valid signatures for both versions on the same transaction.
+$migrationOrder = new FakeIPNOrder();
+$migrationPaid = v2Payload('migration-paid', 2, 1);
+$migrationPaid['sessionPublicId'] = 'migration-session';
+$migrationBody = json_encode($migrationPaid, JSON_THROW_ON_ERROR);
+$migrationVerified = WC_Payment_Gateway_App_IPN_Request::verify($migrationBody, signedHeaders($migrationBody, $secret, $now, '2', 'migration-paid'), $secret, $now);
+ipnAssertSame(true, $migrationVerified['ok'], 'MIG-001 paid event must be signed and validated.');
+WC_Payment_Gateway_App_IPN_V2_Processor::process($migrationOrder, 'transaction-123', $migrationVerified['payload'], $migrationBody, static function ($order): void {
+    $order->payment_complete('transaction-123');
+});
+$migrationLegacy = array('id' => 'transaction-123', 'externalReference' => '42', 'sessionPublicId' => 'migration-session', 'status' => 2);
+$migrationLegacyBody = json_encode($migrationLegacy, JSON_THROW_ON_ERROR);
+$migrationLegacyVerified = WC_Payment_Gateway_App_IPN_Request::verify($migrationLegacyBody, signedHeaders($migrationLegacyBody, $secret, $now), $secret, $now);
+ipnAssertSame(true, $migrationLegacyVerified['ok'], 'MIG-001 stale legacy event must be validly signed.');
+$migrationLegacyResult = WC_Payment_Gateway_App_IPN_V1_Processor::process($migrationOrder, 'transaction-123', $migrationLegacyVerified['payload'], static function ($order): void {
+    $order->update_status('failed');
+});
+ipnAssertSame('processing', $migrationOrder->status, 'MIG-001: same-transaction v1 failure must not undo v2 payment.');
+
+ipnAssertSame('outdated', $migrationLegacyResult, 'A fenced legacy event must be acknowledged without effects.');
+$migrationRefund = array_merge($migrationPaid, array('deliveryId' => 'migration-refund', 'eventVersion' => 3, 'status' => 3));
+WC_Payment_Gateway_App_IPN_V2_Processor::process($migrationOrder, 'transaction-123', $migrationRefund, json_encode($migrationRefund, JSON_THROW_ON_ERROR), static function ($order): void {
+    $order->update_status('refunded');
+});
+ipnAssertSame('refunded', $migrationOrder->status, 'A newer v2 refund must still take effect after migration fencing.');
+$sessionFenceOrder = new FakeIPNOrder();
+$sessionPayload = array_merge($migrationPaid, array('status' => 0));
+WC_Payment_Gateway_App_IPN_V2_Processor::process($sessionFenceOrder, 'transaction-123', $sessionPayload, json_encode($sessionPayload, JSON_THROW_ON_ERROR), static function (): void {});
+$sessionLegacy = array('id' => 'legacy-other-id', 'externalReference' => '42', 'sessionPublicId' => 'migration-session', 'status' => 1);
+$sessionResult = WC_Payment_Gateway_App_IPN_V1_Processor::process($sessionFenceOrder, 'legacy-other-id', $sessionLegacy, static function ($order): void { $order->payment_complete('legacy-other-id'); });
+ipnAssertSame('outdated', $sessionResult, 'A v1 event cannot bypass a v2 session fence with another transaction ID.');
+$sessionLegacy['sessionPublicId'] = 'new-legacy-session';
+$sessionResult = WC_Payment_Gateway_App_IPN_V1_Processor::process($sessionFenceOrder, 'legacy-other-id', $sessionLegacy, static function ($order): void { $order->payment_complete('legacy-other-id'); });
+ipnAssertSame('applied', $sessionResult, 'A fresh distinct checkout may still use v1 after v2.');
+ipnAssertSame('processing', $sessionFenceOrder->status, 'The fresh legacy checkout must retain its payment effect.');
+
+// Unknown versions and a strictly typed v1 schema cannot enter legacy processing.
+foreach (array(3, 1.5, '1', null) as $unknownSchema) {
+    $unknownBody = json_encode(array('schemaVersion' => $unknownSchema, 'id' => 'transaction-123', 'externalReference' => '42', 'status' => 1), JSON_THROW_ON_ERROR);
+    $unknownResult = WC_Payment_Gateway_App_IPN_Request::verify($unknownBody, signedHeaders($unknownBody, $secret, $now, '1'), $secret, $now);
+    ipnAssertSame(false, $unknownResult['ok'], 'A legacy header cannot coerce an unknown schema into v1.');
+}
+
+// Readiness probes are signed v2 control messages, never synthetic payments.
+$probe = array('schemaVersion' => 2, 'eventType' => 'ipn.test', 'deliveryId' => 'probe/id+1', 'occurredAt' => '2026-08-31T18:00:00Z');
+$probeBody = json_encode($probe, JSON_THROW_ON_ERROR);
+$probeResult = WC_Payment_Gateway_App_IPN_Request::verify($probeBody, signedHeaders($probeBody, $secret, $now, '2', $probe['deliveryId']), $secret, $now);
+ipnAssertSame(true, $probeResult['ok'], 'A signed canonical readiness probe must be accepted without payment identity.');
+ipnAssertSame(array('schemaVersion' => 2, 'eventType' => 'ipn.test', 'deliveryId' => 'probe/id+1'), $probeResult['probeResponse'] ?? null, 'Readiness must return the exact signed delivery identity.');
+foreach (array(
+    array_merge($probe, array('status' => 1)),
+    array_merge($probe, array('id' => 'transaction-123')),
+    array_merge($probe, array('externalReference' => '42')),
+    array_merge($probe, array('sessionPublicId' => 'migration-session')),
+    array_merge($probe, array('eventVersion' => 1)),
+    array_merge($probe, array('eventType' => 'ipn.future')),
+    array_merge($probe, array('occurredAt' => 'invalid')),
+) as $malformedProbe) {
+    $malformedBody = json_encode($malformedProbe, JSON_THROW_ON_ERROR);
+    $malformedResult = WC_Payment_Gateway_App_IPN_Request::verify($malformedBody, signedHeaders($malformedBody, $secret, $now, '2', $probe['deliveryId']), $secret, $now);
+    ipnAssertSame(false, $malformedResult['ok'], 'Malformed or hybrid readiness messages must not be accepted.');
+}
+foreach (array('bad-signature', 'wrong-delivery', 'unknown-version', 'missing-version') as $probeFailure) {
+    $probeHeaders = signedHeaders($probeBody, $secret, $now, '2', $probe['deliveryId']);
+    if ($probeFailure === 'bad-signature') { $probeHeaders['signature'] = str_repeat('0', 64); }
+    if ($probeFailure === 'wrong-delivery') { $probeHeaders['delivery_id'] = 'wrong'; }
+    if ($probeFailure === 'unknown-version') { $probeHeaders['version'] = '3'; }
+    if ($probeFailure === 'missing-version') { unset($probeHeaders['version']); }
+    $invalidProbe = WC_Payment_Gateway_App_IPN_Request::verify($probeBody, $probeHeaders, $secret, $now);
+    ipnAssertSame(false, $invalidProbe['ok'], 'Probe admission must reject ' . $probeFailure . '.');
+}
+
 // Bounded delivery retention is safe because the monotonic version rejects replay.
 $retentionOrder = new FakeIPNOrder();
 for ($version = 1; $version <= 101; $version++) {
@@ -1230,5 +1302,28 @@ $collision = WC_Payment_Gateway_App_IPN_V2_Processor::process($order, 'transacti
 ipnAssertSame('conflict', $collision, 'A delivery ID reused for different content must not be applied or acknowledged as the original event.');
 
 ipnAssertTrue(!str_contains(serialize($retainedState), $retainedBody), 'Persistent deduplication state must not retain raw webhook payloads.');
+
+// Exercise the real terminating HTTP handler, including dispatch before order lookup.
+foreach (array('probe', 'bad-signature', 'wrong-delivery', 'unknown-version', 'hybrid', 'migration') as $httpCase) {
+    $process = proc_open(array(PHP_BINARY, __DIR__ . '/fixtures/ipn-http-driver.php', $httpCase), array(1 => array('pipe', 'w'), 2 => array('pipe', 'w')), $pipes);
+    $output = stream_get_contents($pipes[1]);
+    $errors = stream_get_contents($pipes[2]);
+    fclose($pipes[1]); fclose($pipes[2]);
+    ipnAssertSame(0, proc_close($process), 'The HTTP driver must exit normally: ' . $httpCase);
+    ipnAssertSame('', $errors, 'The HTTP driver must emit no warnings: ' . $httpCase);
+    $http = json_decode($output, true, 512, JSON_THROW_ON_ERROR);
+    ipnAssertSame($httpCase === 'probe' || $httpCase === 'migration' ? 200 : 400, $http['httpStatus'], 'HTTP admission must return the correct status: ' . $httpCase);
+    ipnAssertSame(true, $http['unchangedMetadata'], 'Probe and stale legacy HTTP requests must not persist state.');
+    if ($httpCase === 'migration') {
+        ipnAssertSame('OK', $http['body'], 'A stale legacy delivery must be acknowledged by the HTTP dispatcher.');
+        ipnAssertSame('processing', $http['status'], 'HTTP v1 dispatch must not undo a v2 payment.');
+    } else {
+        ipnAssertSame(0, $http['lookups'], 'A probe must not look up an order.');
+        ipnAssertSame('pending', $http['status'], 'A probe must not affect payments.');
+    }
+    if ($httpCase === 'probe') {
+        ipnAssertSame(array('schemaVersion' => 2, 'eventType' => 'ipn.test', 'deliveryId' => 'http-probe/id'), json_decode($http['body'], true, 512, JSON_THROW_ON_ERROR), 'HTTP readiness response must identify the signed probe.');
+    }
+}
 
 echo "WooCommerce IPN v2 receiver contract: PASS\n";

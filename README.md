@@ -76,11 +76,47 @@ order CRUD, acknowledges duplicate or older events without repeating their
 effects, and prevents a late status from replacing a newer transaction state.
 This storage path remains compatible with WooCommerce HPOS.
 
-During the announced migration window, existing sites without an IPN version
-header continue to use the v1 receiver. Upgrade this plugin before opting the
-site into IPN v2 in Payment Gateway App. Once a site is configured for v2, do
-not downgrade the plugin to a version that predates v2 support. V1 retirement
-will be announced separately with its removal release and deadline.
+Existing or unversioned gateway sites remain v1; newly created sites default
+to v2. Upgrade this plugin before explicitly selecting v2 for the site. The
+gateway sends one selected format, with no automatic negotiation or dual-send.
+Do not downgrade to a plugin that predates v2 support.
+
+Legacy v1 remains supported through **2027-06-30**, with no date-only shutdown.
+Keep the old destination URL and signing configuration available for existing
+deliveries and manual retries until migration is complete. After a transaction
+or signed checkout session accepts v2, v1 notifications for the same identity
+are acknowledged without effects. A site rollback to v1 therefore applies to
+fresh checkouts; existing v2 transactions, refunds and replays must remain v2.
+
+Order metadata retains transaction watermarks and accepted session identities
+for the order lifetime. At most 100 recent delivery records are retained per
+transaction, with the latest recoverable effect protected. Removing old history
+does not reset ordering or allow a stale manual replay. All persistence uses
+WooCommerce CRUD, including HPOS, under the same order lock as checkout identity
+updates. Never clear receiver metadata to force a replay.
+
+The signed v2 readiness probe contains exactly `schemaVersion: 2`,
+`eventType: "ipn.test"`, `deliveryId`, and `occurredAt`, with normal HMAC headers
+and a matching `X-IPN-Delivery-ID`. The endpoint returns HTTP 200 JSON containing
+`schemaVersion: 2`, `eventType: "ipn.test"`, and the same delivery ID before any
+order lookup or payment effect. Hybrid payment/probe messages are rejected.
+This is an informative test action, not version negotiation or a payment test.
+
+=== Maintenance and v1 removal (PG-242) ===
+
+Payments-platform owns the temporary legacy adapter. PG-242 removes it after
+legacy sites, queued deliveries and manual-replay obligations are migrated;
+the support date alone is not sufficient. Delete `WC_Payment_Gateway_App_IPN_V1_Processor`,
+v1 branches in `WC_Payment_Gateway_App_IPN_Request::verify`, legacy identity and
+dispute parsing, and v1 compatibility cases in receiver/customer-risk tests.
+Keep the order lock, checkout identity protection, v2 processor metadata and
+all v2 ordering, partial-effect, readiness and HPOS tests. Preserve existing
+orders' durable protection across plugin upgrades.
+
+A later supported wire version requires an explicit validated dispatch branch
+and a narrow adapter that reuses order synchronization and effect protection.
+Define its ordering transition explicitly and reject unknown versions. Do not
+fabricate v2 envelopes for legacy traffic or add a generic version registry.
 
 If you suspect your Webhook Signing Secret has been compromised,
 regenerate it in Payment Gateway App admin -> Sites -> Edit and update

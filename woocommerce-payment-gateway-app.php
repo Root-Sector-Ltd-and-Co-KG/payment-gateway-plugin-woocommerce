@@ -65,7 +65,7 @@ final class WC_Payment_Gateway_App_IPN_Request
             return self::success(1, $payload);
         }
         if ($version_header === '1') {
-            if (isset($payload['schemaVersion']) && (int) $payload['schemaVersion'] !== 1) {
+            if (array_key_exists('schemaVersion', $payload) && (!is_int($payload['schemaVersion']) || $payload['schemaVersion'] !== 1)) {
                 return self::failure('version_mismatch');
             }
             return self::success(1, $payload);
@@ -88,11 +88,22 @@ final class WC_Payment_Gateway_App_IPN_Request
         if (!hash_equals($payload['deliveryId'], $header_delivery_id)) {
             return self::failure('delivery_id_mismatch');
         }
-        if (!isset($payload['eventVersion']) || !is_int($payload['eventVersion']) || $payload['eventVersion'] <= 0) {
-            return self::failure('invalid_event_version');
-        }
         if (!isset($payload['occurredAt']) || !self::valid_occurred_at($payload['occurredAt'])) {
             return self::failure('invalid_occurred_at');
+        }
+        if (array_key_exists('eventType', $payload)) {
+            // Dedicated control message: it must never carry payment fields.
+            if ($payload['eventType'] !== 'ipn.test' || count($payload) !== 4) {
+                return self::failure('invalid_probe');
+            }
+            return self::success(2, $payload) + array('probeResponse' => array(
+                'schemaVersion' => 2,
+                'eventType' => 'ipn.test',
+                'deliveryId' => $payload['deliveryId'],
+            ));
+        }
+        if (!isset($payload['eventVersion']) || !is_int($payload['eventVersion']) || $payload['eventVersion'] <= 0) {
+            return self::failure('invalid_event_version');
         }
         foreach (array('transactionId', 'gatewayTransactionId', 'external_reference', 'paymentStatus', 'disputeStatus', 'chargebackStatus', 'chargeback') as $legacy_alias) {
             if (array_key_exists($legacy_alias, $payload)) {
@@ -233,10 +244,23 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
 {
     const STATE_FORMAT_VERSION = 1;
     const MAX_RETAINED_DELIVERIES = 100;
+    const ACCEPTED_SESSIONS_META_KEY = '_payment_gateway_app_ipn_v2_sessions';
 
     public static function meta_key($transaction_id)
     {
         return '_payment_gateway_app_ipn_v2_' . hash('sha256', (string) $transaction_id);
+    }
+
+    // Caller holds the order lock and has validated the signed payload.
+    public static function has_accepted_transaction($order, $transaction_id, array $payload)
+    {
+        $state = self::load_state($order->get_meta(self::meta_key($transaction_id), true));
+        $sessions = $order->get_meta(self::ACCEPTED_SESSIONS_META_KEY, true);
+        if ($sessions !== '' && !is_array($sessions)) {
+            throw new UnexpectedValueException('Invalid persisted IPN v2 sessions.');
+        }
+        return $state['highestEventVersion'] > 0
+            || (isset($payload['sessionPublicId']) && !empty($sessions[hash('sha256', $payload['sessionPublicId'])]));
     }
 
     public static function process($order, $transaction_id, array $payload, $raw_body, callable $apply_effect)
@@ -345,6 +369,18 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             $transaction_id,
             $payload,
             static function ($effect_order) use ($apply_effect, $payload) {
+                if (isset($payload['sessionPublicId'])) {
+                    $sessions = $effect_order->get_meta(self::ACCEPTED_SESSIONS_META_KEY, true);
+                    if ($sessions === '') {
+                        $sessions = array();
+                    }
+                    if (!is_array($sessions)) {
+                        throw new UnexpectedValueException('Invalid persisted IPN v2 sessions.');
+                    }
+                    $sessions[hash('sha256', $payload['sessionPublicId'])] = true;
+                    $effect_order->update_meta_data(self::ACCEPTED_SESSIONS_META_KEY, $sessions);
+                    $effect_order->save();
+                }
                 $apply_effect($effect_order, $payload);
             }
         );
@@ -449,6 +485,18 @@ final class WC_Payment_Gateway_App_IPN_V2_Processor
             }
         }
         return $state;
+    }
+}
+
+// PG-242: delete this legacy adapter; retain shared order synchronization and attempt checks.
+final class WC_Payment_Gateway_App_IPN_V1_Processor
+{
+    public static function process($order, $transaction_id, array $payload, callable $apply_effect)
+    {
+        if (WC_Payment_Gateway_App_IPN_V2_Processor::has_accepted_transaction($order, $transaction_id, $payload)) {
+            return 'outdated';
+        }
+        return WC_Payment_Gateway_App_IPN_Order_Attempt::apply($order, $transaction_id, $payload, $apply_effect);
     }
 }
 
@@ -1168,6 +1216,11 @@ function init_woocommerce_payment_gateway_app()
                 status_header(400);
                 exit("Invalid webhook request");
             }
+            if (isset($verified_request['probeResponse'])) {
+                status_header(200);
+                header('Content-Type: application/json');
+                exit(json_encode($verified_request['probeResponse'], JSON_UNESCAPED_SLASHES));
+            }
             $parsed_request = $verified_request['payload'];
 
             $dispute_status = $this->get_dispute_status($parsed_request);
@@ -1207,7 +1260,7 @@ function init_woocommerce_payment_gateway_app()
                                 }
                             );
                         }
-                        return WC_Payment_Gateway_App_IPN_Order_Attempt::apply(
+                        return WC_Payment_Gateway_App_IPN_V1_Processor::process(
                             $locked_order,
                             $transaction_id,
                             $parsed_request,
