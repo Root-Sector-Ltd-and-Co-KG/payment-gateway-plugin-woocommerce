@@ -1,0 +1,10 @@
+{
+  "$schema": "https://schemas.wp.org/trunk/wp-env.json",
+  "core": "WordPress/WordPress#7.0.3",
+  "phpVersion": "8.2",
+  "testsEnvironment": false,
+  "plugins": [
+    "https://github.com/woocommerce/woocommerce/releases/download/11.0.0/woocommerce.zip",
+    "."
+  ]
+}

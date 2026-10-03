@@ -26,14 +26,23 @@ function prepareRelease(string $root, string $version): void
         'README Stable tag'
     );
 
+    if (!preg_match_all('/^==\h+Changelog\h+==\h*\R(?<body>.*?)(?=^==\h+[^=\r\n]+\h+==\h*$|\z)/ms', $readme, $sections) || count($sections['body']) !== 1) {
+        throw new RuntimeException('README must contain exactly one Changelog section.');
+    }
+
     $escapedVersion = preg_quote($version, '/');
-    if (!preg_match('/^=\h+' . $escapedVersion . '\h+=\h*\R.*?(?=^=\h+\d+\.\d+\.\d+\h+=|\z)/ms', $readme, $matches)) {
-        throw new RuntimeException("README changelog entry for {$version} was not found.");
+    preg_match_all(
+        '/^=\h+' . $escapedVersion . '\h+=\h*\R.*?(?=^=\h+\d+\.\d+\.\d+\h+=|\z)/ms',
+        $sections['body'][0],
+        $entries
+    );
+    if (count($entries[0]) !== 1) {
+        throw new RuntimeException("README must contain exactly one changelog entry for {$version}; found " . count($entries[0]) . '.');
     }
 
     writeReleaseFile($pluginPath, $plugin);
     writeReleaseFile($readmePath, $readme);
-    writeReleaseFile($root . '/RELEASE.md', rtrim($matches[0]) . PHP_EOL);
+    writeReleaseFile($root . '/RELEASE.md', rtrim($entries[0][0]) . PHP_EOL);
 }
 
 function readReleaseFile(string $path): string
