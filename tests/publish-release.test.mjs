@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { publishPluginRelease } from "../scripts/publish-release.mjs";
+import { createGitHubClient, publishPluginRelease } from "../scripts/publish-release.mjs";
 
 const sourceRevision = "a".repeat(40);
 const digest = (body) => `sha256:${createHash("sha256").update(body).digest("hex")}`;
@@ -32,6 +32,60 @@ function fixture() {
     return { name, path: filePath, body, digest: digest(body) };
   });
   return { root, files };
+}
+
+function fakeGh(t, scenario) {
+  const root = mkdtempSync(path.join(os.tmpdir(), "plugin-publish-gh-"));
+  const executable = path.resolve(root, "gh");
+  const scenarioPath = path.resolve(root, "scenario.json");
+  const callsPath = path.resolve(root, "calls.jsonl");
+  writeFileSync(scenarioPath, JSON.stringify(scenario));
+  writeFileSync(executable, `#!/usr/bin/env node
+const fs = require("node:fs");
+const args = process.argv.slice(2);
+const callsPath = ${JSON.stringify(callsPath)};
+const scenarioPath = ${JSON.stringify(scenarioPath)};
+fs.appendFileSync(callsPath, JSON.stringify(args) + "\\n");
+const scenario = JSON.parse(fs.readFileSync(scenarioPath, "utf8"));
+const endpoint = args.find((arg) => arg.startsWith("repos/"));
+const method = args[args.indexOf("--method") + 1];
+function fail(message, status = 1) {
+  process.stderr.write(message + "\\n");
+  process.exit(status);
+}
+if (method === "GET" && endpoint?.includes("/releases/tags/")) {
+  if (scenario.tagError) fail(scenario.tagError, 2);
+  if (!scenario.published) fail("HTTP 404: Not Found");
+  process.stdout.write(JSON.stringify(scenario.published));
+} else if (method === "GET" && endpoint?.endsWith("/releases?per_page=100")) {
+  if (scenario.listError) fail(scenario.listError, 2);
+  process.stdout.write(JSON.stringify(scenario.pages || [[]]));
+} else if (method === "POST" && endpoint?.endsWith("/releases")) {
+  const input = JSON.parse(fs.readFileSync(0, "utf8"));
+  const release = {
+    id: 99,
+    tag_name: input.tag_name,
+    name: input.name,
+    body: input.body,
+    draft: true,
+    prerelease: false,
+    assets: [],
+  };
+  scenario.pages = scenario.pages || [[]];
+  scenario.pages[0].push(release);
+  fs.writeFileSync(scenarioPath, JSON.stringify(scenario));
+  process.stdout.write(JSON.stringify(release));
+} else {
+  fail("Unexpected fake gh invocation: " + JSON.stringify(args), 3);
+}
+`);
+  chmodSync(executable, 0o755);
+
+  t.after(() => rmSync(root, { recursive: true }));
+  return {
+    executable,
+    calls: () => readFileSync(callsPath, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse),
+  };
 }
 
 function fakeGitHub({
@@ -229,4 +283,104 @@ test("an interrupted upload leaves the release as a resumable draft", async (t) 
 
   assert.ok(github.calls.includes("create-draft"));
   assert.ok(!github.calls.includes("publish"));
+});
+
+test("GitHub adapter prefers the published by-tag endpoint without listing drafts", async (t) => {
+  const published = {
+    id: 40,
+    tag_name: "1.2.0",
+    name: "Plugin 1.2.0",
+    body: "Release notes",
+    draft: false,
+    prerelease: false,
+    assets: [],
+  };
+  const gh = fakeGh(t, { published, listError: "draft listing must not run" });
+
+  assert.deepEqual(await createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"), {
+    id: 40,
+    ...expectedMetadata,
+    draft: false,
+    assets: [],
+  });
+  assert.equal(gh.calls().length, 1);
+});
+
+test("GitHub adapter reads back a newly created draft through the paginated release list", async (t) => {
+  const gh = fakeGh(t, { pages: [[], []] });
+  const github = createGitHubClient("owner/plugin", gh.executable);
+
+  await github.createDraftRelease({
+    tagName: "1.2.0",
+    title: "Plugin 1.2.0",
+    notes: "Release notes",
+  });
+
+  assert.deepEqual(await github.getRelease("1.2.0"), draftRelease({ id: 99 }));
+  const calls = gh.calls();
+  assert.equal(calls.length, 3);
+  assert.ok(calls[2].includes("--paginate"));
+  assert.ok(calls[2].includes("--slurp"));
+});
+
+test("GitHub adapter discovers one exact matching draft on a later page for resume", async (t) => {
+  const draft = {
+    id: 51,
+    tag_name: "1.2.0",
+    name: "Plugin 1.2.0",
+    body: "Release notes",
+    draft: true,
+    prerelease: false,
+    assets: [],
+  };
+  const gh = fakeGh(t, {
+    pages: [
+      [{ ...draft, id: 41, tag_name: "1.1.0" }],
+      [draft],
+    ],
+  });
+
+  assert.deepEqual(
+    await createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+    draftRelease({ id: 51 }),
+  );
+});
+
+test("GitHub adapter returns absent when no release has the exact tag", async (t) => {
+  const gh = fakeGh(t, { pages: [[{ tag_name: "1.1.0" }], []] });
+  assert.equal(await createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"), null);
+});
+
+test("GitHub adapter rejects duplicate exact draft matches", async (t) => {
+  const draft = {
+    id: 51,
+    tag_name: "1.2.0",
+    name: "Plugin 1.2.0",
+    body: "Release notes",
+    draft: true,
+    prerelease: false,
+    assets: [],
+  };
+  const gh = fakeGh(t, { pages: [[draft], [{ ...draft, id: 52 }]] });
+
+  await assert.rejects(
+    () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+    /multiple releases.*exact tag/i,
+  );
+});
+
+test("GitHub adapter preserves non-404 by-tag and draft-list API failures", async (t) => {
+  const gh = fakeGh(t, { tagError: "HTTP 500: tag lookup failed" });
+  await assert.rejects(
+    () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+    /tag lookup failed/i,
+  );
+});
+
+test("GitHub adapter fails when paginated draft discovery fails", async (t) => {
+  const gh = fakeGh(t, { listError: "HTTP 503: draft listing failed" });
+  await assert.rejects(
+    () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+    /draft listing failed/i,
+  );
 });
