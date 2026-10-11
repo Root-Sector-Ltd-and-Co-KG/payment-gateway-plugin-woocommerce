@@ -55,8 +55,12 @@ function fail(message, status = 1) {
 }
 if (method === "GET" && endpoint?.includes("/releases/tags/")) {
   if (scenario.tagError) fail(scenario.tagError, 2);
-  if (!scenario.published) fail("HTTP 404: Not Found");
-  process.stdout.write(JSON.stringify(scenario.published));
+  if (Object.hasOwn(scenario, "tagOutput")) {
+    process.stdout.write(scenario.tagOutput);
+  } else {
+    if (!scenario.published) fail("HTTP 404: Not Found");
+    process.stdout.write(JSON.stringify(scenario.published));
+  }
 } else if (method === "GET" && endpoint?.endsWith("/releases?per_page=100")) {
   if (scenario.listError) fail(scenario.listError, 2);
   process.stdout.write(JSON.stringify(scenario.pages || [[]]));
@@ -375,6 +379,44 @@ test("GitHub adapter preserves non-404 by-tag and draft-list API failures", asyn
     () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
     /tag lookup failed/i,
   );
+});
+
+test("GitHub adapter does not treat a non-404 error containing not found as absence", async (t) => {
+  const gh = fakeGh(t, { tagError: "HTTP 500: upstream index not found" });
+  await assert.rejects(
+    () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+    /upstream index not found/i,
+  );
+  assert.equal(gh.calls().length, 1);
+});
+
+test("GitHub adapter does not treat malformed successful output as absence", async (t) => {
+  const gh = fakeGh(t, { tagOutput: "Not Found" });
+  await assert.rejects(
+    () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+    /JSON|unexpected token/i,
+  );
+  assert.equal(gh.calls().length, 1);
+});
+
+test("GitHub adapter does not treat a blank successful response as absence", async (t) => {
+  const gh = fakeGh(t, { tagOutput: "" });
+  await assert.rejects(
+    () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+    /empty response/i,
+  );
+  assert.equal(gh.calls().length, 1);
+});
+
+test("GitHub adapter does not treat falsey JSON responses as absence", async (t) => {
+  for (const tagOutput of ["null", "false"]) {
+    const gh = fakeGh(t, { tagOutput });
+    await assert.rejects(
+      () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+      /falsey JSON response/i,
+    );
+    assert.equal(gh.calls().length, 1);
+  }
 });
 
 test("GitHub adapter fails when paginated draft discovery fails", async (t) => {

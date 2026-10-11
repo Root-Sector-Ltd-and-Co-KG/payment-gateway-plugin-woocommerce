@@ -142,21 +142,26 @@ export async function publishPluginRelease({
 }
 
 function ghFailureIs404(error) {
-  return /(?:HTTP 404|not found)/i.test(String(error?.stderr || error?.message || ""));
+  return /\bHTTP 404\b/i.test(String(error?.stderr || error?.message || ""));
 }
 
 function ghJson(args, { input, allow404 = false, executable = "gh" } = {}) {
+  let output;
   try {
-    const output = execFileSync(executable, args, {
+    output = execFileSync(executable, args, {
       encoding: "utf8",
       input,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    return output.trim() ? JSON.parse(output) : null;
   } catch (error) {
     if (allow404 && ghFailureIs404(error)) return null;
     throw error;
   }
+  const body = output.trim();
+  if (!body) throw new Error("GitHub API returned an empty response");
+  const parsed = JSON.parse(body);
+  if (!parsed) throw new Error("GitHub API returned a falsey JSON response");
+  return parsed;
 }
 
 function mapRelease(release) {
