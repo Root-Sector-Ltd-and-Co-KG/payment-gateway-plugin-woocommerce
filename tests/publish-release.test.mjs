@@ -390,6 +390,28 @@ test("GitHub adapter does not treat a non-404 error containing not found as abse
   assert.equal(gh.calls().length, 1);
 });
 
+test("GitHub adapter treats one genuine gh HTTP 404 status as absence", async (t) => {
+  const gh = fakeGh(t, { tagError: "gh: Not Found (HTTP 404)", pages: [[]] });
+
+  assert.equal(await createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"), null);
+  assert.equal(gh.calls().length, 2);
+});
+
+test("GitHub adapter rejects failures with non-404, conflicting, or repeated status markers", async (t) => {
+  for (const tagError of [
+    "HTTP 500: upstream returned HTTP 404",
+    "gh: upstream HTTP 404 (HTTP 500)",
+    "gh: Not Found (HTTP 404); retry failed (HTTP 404)",
+  ]) {
+    const gh = fakeGh(t, { tagError });
+    await assert.rejects(
+      () => createGitHubClient("owner/plugin", gh.executable).getRelease("1.2.0"),
+      /HTTP/i,
+    );
+    assert.equal(gh.calls().length, 1);
+  }
+});
+
 test("GitHub adapter does not treat malformed successful output as absence", async (t) => {
   const gh = fakeGh(t, { tagOutput: "Not Found" });
   await assert.rejects(

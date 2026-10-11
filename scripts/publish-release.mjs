@@ -142,7 +142,8 @@ export async function publishPluginRelease({
 }
 
 function ghFailureIs404(error) {
-  return /\bHTTP 404\b/i.test(String(error?.stderr || error?.message || ""));
+  const statuses = [...String(error?.stderr || error?.message || "").matchAll(/\bHTTP\s+(\d{3})\b/gi)];
+  return statuses.length === 1 && statuses[0][1] === "404";
 }
 
 function ghJson(args, { input, allow404 = false, executable = "gh" } = {}) {
