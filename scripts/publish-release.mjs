@@ -142,21 +142,27 @@ export async function publishPluginRelease({
 }
 
 function ghFailureIs404(error) {
-  return /(?:HTTP 404|not found)/i.test(String(error?.stderr || error?.message || ""));
+  const statuses = [...String(error?.stderr || error?.message || "").matchAll(/\bHTTP\s+(\d{3})\b/gi)];
+  return statuses.length === 1 && statuses[0][1] === "404";
 }
 
-function ghJson(args, { input, allow404 = false } = {}) {
+function ghJson(args, { input, allow404 = false, executable = "gh" } = {}) {
+  let output;
   try {
-    const output = execFileSync("gh", args, {
+    output = execFileSync(executable, args, {
       encoding: "utf8",
       input,
       stdio: ["pipe", "pipe", "pipe"],
     });
-    return output.trim() ? JSON.parse(output) : null;
   } catch (error) {
     if (allow404 && ghFailureIs404(error)) return null;
     throw error;
   }
+  const body = output.trim();
+  if (!body) throw new Error("GitHub API returned an empty response");
+  const parsed = JSON.parse(body);
+  if (!parsed) throw new Error("GitHub API returned a falsey JSON response");
+  return parsed;
 }
 
 function mapRelease(release) {
@@ -176,17 +182,18 @@ function mapRelease(release) {
   };
 }
 
-export function createGitHubClient(repository) {
+export function createGitHubClient(repository, executable = "gh") {
+  const api = (args, options = {}) => ghJson(args, { ...options, executable });
   return {
     async resolveTag(version) {
-      let reference = ghJson(
+      let reference = api(
         ["api", "--method", "GET", `repos/${repository}/git/ref/tags/${encodeURIComponent(version)}`],
         { allow404: true },
       );
       if (!reference) return null;
       let object = reference.object;
       for (let depth = 0; depth < 2 && object?.type === "tag"; depth += 1) {
-        object = ghJson([
+        object = api([
           "api",
           "--method",
           "GET",
@@ -196,7 +203,7 @@ export function createGitHubClient(repository) {
       return requireFullRevision(object?.sha, "resolved tag target");
     },
     async createTag(version, sourceRevision) {
-      ghJson(
+      api(
         ["api", "--method", "POST", `repos/${repository}/git/refs`, "--input", "-"],
         {
           input: JSON.stringify({
@@ -207,14 +214,31 @@ export function createGitHubClient(repository) {
       );
     },
     async getRelease(version) {
-      const release = ghJson(
+      const published = api(
         ["api", "--method", "GET", `repos/${repository}/releases/tags/${encodeURIComponent(version)}`],
         { allow404: true },
       );
-      return mapRelease(release);
+      if (published) return mapRelease(published);
+
+      const pages = api([
+        "api",
+        "--method",
+        "GET",
+        "--paginate",
+        "--slurp",
+        `repos/${repository}/releases?per_page=100`,
+      ]);
+      if (!Array.isArray(pages) || !pages.every(Array.isArray)) {
+        throw new Error("Paginated release listing returned an unexpected response");
+      }
+      const matches = pages.flat().filter((release) => release?.tag_name === version);
+      if (matches.length > 1) {
+        throw new Error(`Multiple releases have the exact tag ${version}`);
+      }
+      return mapRelease(matches[0] || null);
     },
     async createDraftRelease({ tagName, title, notes }) {
-      return ghJson(
+      return api(
         ["api", "--method", "POST", `repos/${repository}/releases`, "--input", "-"],
         {
           input: JSON.stringify({
@@ -229,14 +253,14 @@ export function createGitHubClient(repository) {
     },
     async uploadAsset({ tagName, name, path: filePath }) {
       execFileSync(
-        "gh",
+        executable,
         ["release", "upload", tagName, `${filePath}#${name}`, "--repo", repository],
         { stdio: ["ignore", "pipe", "pipe"] },
       );
     },
     async downloadAsset(asset) {
       return execFileSync(
-        "gh",
+        executable,
         [
           "api",
           "--method",
@@ -249,7 +273,7 @@ export function createGitHubClient(repository) {
       );
     },
     async publishRelease(releaseId, { title, notes }) {
-      return mapRelease(ghJson(
+      return mapRelease(api(
         ["api", "--method", "PATCH", `repos/${repository}/releases/${releaseId}`, "--input", "-"],
         {
           input: JSON.stringify({
