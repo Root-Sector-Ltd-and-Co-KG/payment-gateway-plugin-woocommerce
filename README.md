@@ -191,6 +191,12 @@ downgrade from v2 is supported.
 
 == Changelog ==
 
+= 1.2.1 =
+
+- Fix: Show an actionable billing phone notice before checkout when address forwarding is enabled: use + and the country code followed by digits, without spaces or brackets.
+- Compatibility: Allow an empty optional billing phone and leave checkout unchanged when billing address forwarding is disabled.
+- Safety: Let customers correct the phone number at checkout without silently rewriting it or sending an invalid phone to the gateway.
+
 = 1.2.0 =
 
 - Enhancement: Add signed IPN v2 contract validation and stable delivery identity checks.

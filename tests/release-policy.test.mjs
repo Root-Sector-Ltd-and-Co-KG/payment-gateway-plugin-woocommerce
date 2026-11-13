@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -166,6 +166,105 @@ test("release policy rejects source retargeting, under-versioning, and malformed
     /valid Conventional Commit/,
   );
 });
+test("release policy CLI excludes merge envelopes and validates every source commit", async (t) => {
+  const scenarios = [
+    { name: "merged fix permits a patch", message: "fix(checkout): explain phone correction", version: "1.2.1", bump: "patch" },
+    { name: "merged feature requires a minor", message: "feat(checkout): add a payment option", version: "1.3.0", bump: "minor" },
+    { name: "merged feature rejects a patch", message: "feat(checkout): add a payment option", version: "1.2.1", error: /calculated minor version 1\.3\.0/ },
+    { name: "merged breaking header requires a major", message: "fix(checkout)!: replace checkout contract", version: "2.0.0", bump: "major" },
+    { name: "merged breaking footer requires a major", message: "fix(checkout): replace checkout contract\n\nBREAKING CHANGE: Clients must migrate to checkout v2.", version: "2.0.0", bump: "major" },
+    { name: "merged breaking change rejects a minor", message: "feat(checkout)!: replace checkout contract", version: "1.3.0", error: /calculated major version 2\.0\.0/ },
+    { name: "nonmerge message resembling an envelope is still rejected", message: "Merge pull request #42 from fixture/change", version: "1.2.1", error: /must use a valid Conventional Commit message/ },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, (t) => {
+      const fixtureRoot = mkdtempSync(path.join(os.tmpdir(), "release-policy-history-"));
+      t.after(() => rmSync(fixtureRoot, { recursive: true, force: true }));
+      const repository = path.join(fixtureRoot, "source");
+      const emptyHooks = path.join(fixtureRoot, "empty-hooks");
+      mkdirSync(repository);
+      mkdirSync(emptyHooks);
+      const git = (...args) => execFileSync("git", [
+        "-C", repository,
+        "-c", "user.name=Release policy fixture",
+        "-c", "user.email=release-policy@example.invalid",
+        "-c", "commit.gpgsign=false",
+        "-c", "tag.gpgsign=false",
+        "-c", `core.hooksPath=${emptyHooks}`,
+        ...args,
+      ], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+      git("init", "--initial-branch=main", `--template=${emptyHooks}`);
+      writeFileSync(path.join(repository, "README.md"), "= 1.2.1 =\n= 1.3.0 =\n= 2.0.0 =\n");
+      git("add", "README.md");
+      git("commit", "-m", "chore: establish previous release");
+      git("tag", "1.2.0");
+      git("checkout", "-b", "change");
+      writeFileSync(path.join(repository, "change.txt"), "source change\n");
+      git("add", "change.txt");
+      git("commit", "-m", scenario.message);
+      const changeRevision = git("rev-parse", "HEAD");
+      git("checkout", "main");
+      writeFileSync(path.join(repository, "main.txt"), "main change\n");
+      git("add", "main.txt");
+      git("commit", "-m", "fix: preserve main branch changes");
+      git("merge", "--no-ff", "change", "-m", "Merge pull request #42 from fixture/change");
+      const sourceRevision = git("rev-parse", "HEAD");
+      assert.equal(git("show", "-s", "--format=%P", sourceRevision).split(" ").length, 2);
+
+      const manifestPath = path.join(fixtureRoot, "release-policy.json");
+      const outputPath = path.join(fixtureRoot, "validation.json");
+      writeFileSync(manifestPath, JSON.stringify({
+        schemaVersion: 1,
+        defaultBranch: "main",
+        workflowPath: ".github/workflows/phpreleaser.yml",
+        policy: { id: "woocommerce-plugin-release-v1", path: "scripts/validate-release-policy.mjs" },
+        releases: {
+          [scenario.version]: {
+            sourceRevision,
+            artifactName: `woocommerce-payment-gateway-app_v${scenario.version}.zip`,
+            archiveRoot: "woocommerce-payment-gateway-app",
+            prepareScript: "scripts/prepare-release.php",
+            changelogFile: "README.md",
+            changelogHeading: `= ${scenario.version} =`,
+            releaseNotesFile: "RELEASE.md",
+          },
+        },
+      }));
+      const result = spawnSync(process.execPath, [
+        policyPath,
+        "--repository", repository,
+        "--source-sha", sourceRevision,
+        "--version", scenario.version,
+        "--release-manifest", manifestPath,
+        "--workflow-ref", "refs/heads/main",
+        "--default-branch", "main",
+        "--workflow-path", ".github/workflows/phpreleaser.yml",
+        "--policy-path", "scripts/validate-release-policy.mjs",
+        "--policy-revision", "d".repeat(40),
+        "--output", outputPath,
+      ], { encoding: "utf8" });
+      assert.ifError(result.error);
+      if (scenario.error) {
+        assert.equal(result.status, 1);
+        assert.match(result.stderr, scenario.error);
+        if (scenario.error.source.includes("Conventional Commit")) {
+          assert.ok(result.stderr.includes(changeRevision), "Reject the malformed source commit itself");
+        }
+        assert.equal(existsSync(outputPath), false, "Rejected releases must not emit validation evidence");
+      } else {
+        assert.equal(result.status, 0, result.stderr);
+        const evidence = JSON.parse(readFileSync(outputPath, "utf8"));
+        assert.equal(evidence.validated, true);
+        assert.equal(evidence.sourceRevision, sourceRevision);
+        assert.equal(evidence.previousTag, "1.2.0");
+        assert.equal(evidence.version, scenario.version);
+        assert.equal(evidence.requiredBump, scenario.bump);
+      }
+    });
+  }
+});
+
 const controlBundlePath = path.join(root, "scripts/release-control-digest.mjs");
 
 function discoverStaticReleaseControlInputs(entryPaths) {
