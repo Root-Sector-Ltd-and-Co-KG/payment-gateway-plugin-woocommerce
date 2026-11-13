@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,6 +10,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const policyPath = path.join(root, "scripts/validate-release-policy.mjs");
 const finalReceiverRevision = "48f55852e1b7cb6eb4e72a745b4411236fbcb94a";
+// SHA-256 of the raw plugin blob at finalReceiverRevision, independent of the evolving checkout.
+const finalReceiverSha256 = "fb1e9e3ed72aca01f95689e7562d52676589f6e2c6f12129e7d78ac68a874d36";
 
 test("release policy implementation is repository-local", () => {
   assert.ok(existsSync(policyPath), "scripts/validate-release-policy.mjs must exist");
@@ -77,12 +80,11 @@ test("1.2.0 packages the exact final WooCommerce receiver source", () => {
   assert.equal(sourceRevision, finalReceiverRevision);
 
   const pluginPath = "woocommerce-payment-gateway-app.php";
-  const archive = execFileSync("git", ["-C", root, "archive", sourceRevision, pluginPath]);
+  const archive = execFileSync("git", ["-C", root, "-c", "core.autocrlf=false", "archive", sourceRevision, pluginPath]);
   const archivedPlugin = execFileSync("tar", ["-xOf", "-", pluginPath], {
     input: archive,
-    encoding: "utf8",
   });
-  assert.equal(archivedPlugin, readFileSync(path.join(root, pluginPath), "utf8"));
+  assert.equal(createHash("sha256").update(archivedPlugin).digest("hex"), finalReceiverSha256);
 });
 
 test("release policy CLI maps documented kebab-case arguments", async () => {
