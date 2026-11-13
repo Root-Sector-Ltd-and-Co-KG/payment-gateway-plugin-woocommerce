@@ -876,6 +876,15 @@ function init_woocommerce_payment_gateway_app()
                 return;
             }
 
+            // Match the checkout API's optional E.164 syntax without changing customer input.
+            if ('yes' === $this->get_option('pass_billing_address')) {
+                $billing_phone = $order->get_billing_phone();
+                if ($billing_phone !== '' && !preg_match('/\A\+[1-9][0-9]{1,14}\z/', $billing_phone)) {
+                    wc_add_notice(__('Enter your billing phone number starting with + and the country code, followed by digits only, without spaces or brackets. For example: +4930123456.', 'woo-payment-gateway-app'), 'error');
+                    return array('result' => 'failure');
+                }
+            }
+
             // Sanitize and validate inputs (use esc_url_raw for API payloads, not esc_url which is for HTML output)
             $email = sanitize_email($order->get_billing_email());
             $cancelurl = esc_url_raw($order->get_cancel_order_url());
