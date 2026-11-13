@@ -230,6 +230,7 @@ function runCli(argv) {
 
   const shas = git(repository, [
     "log",
+    "--no-merges",
     `${previousTag}..${sourceRevision}`,
     "--format=%H",
   ]).split(/\r?\n/).filter(Boolean);
