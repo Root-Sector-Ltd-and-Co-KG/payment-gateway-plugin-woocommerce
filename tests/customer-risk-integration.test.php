@@ -349,3 +349,16 @@ try { WC_Payment_Gateway_App_Checkout_Amounts::minorUnits(9000000000000.001, 'KW
 catch (InvalidArgumentException $error) { $ambiguousKwdRejected = true; }
 integrationAssert($ambiguousKwdRejected, 'Adjacent KWD minor units must remain distinguishable for legacy floats.');
 integrationAssert(9000000000000001 === WC_Payment_Gateway_App_Checkout_Amounts::minorUnits('9000000000000.001', 'KWD'), 'Canonical decimal strings must retain full minor-unit precision.');
+
+foreach (array(array('1.004', '2.004', 3.00, array(100, 200)), array('0.004', '1.006', 1.01, array(1, 100))) as [$first, $second, $total, $prices]) {
+    $order = new AmountTestOrder(); $order->total = $total;
+    $order->items = array(new AmountTestItem($first, '0', 1, false, 'First'), new AmountTestItem($second, '0', 1, true, 'Second'));
+    [$result, $payload] = amountCheckout($order);
+    integrationAssert($result['result'] === 'success', 'Feasible line rounding must create a checkout.');
+    integrationAssert($prices === array_column($payload['items'], 'unitPrice'), 'Preserve balanced lines or choose valid floor/ceil prices.');
+    integrationAssert(array(1, 1) === array_column($payload['items'], 'quantity'), 'Do not invent items or change quantities.');
+}
+$order = new AmountTestOrder(); $order->total = 1.01;
+$order->items = array(new AmountTestItem('0'), new AmountTestItem('1.01'));
+[$result, $payload] = amountCheckout($order);
+integrationAssert($result['result'] === 'failure' && $payload === null, 'A true zero line has no valid positive floor/ceil and must still fail.');

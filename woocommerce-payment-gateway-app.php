@@ -171,9 +171,37 @@ final class WC_Payment_Gateway_App_Checkout_Amounts
             foreach ($line['values'] as $value) { $values[] = $value; }
             $rounded[] = self::sumMinorUnits($line['values'], $currency);
         }
-        // A genuine mismatch must never be hidden by changing a line. Only
-        // reconcile the rounding of an exact aggregate that matches the order.
-        if (self::sumMinorUnits($values, $currency) !== $amount) {
+        // Merchants may round each line independently. Preserve already-valid
+        // rounded lines when their total matches, even if raw aggregation differs.
+        $needsReconciliation = self::sumMinorUnits($rounded, 'JPY') !== $amount;
+        foreach ($lines as $index => $line) {
+            $candidate = array();
+            try {
+                self::appendLine($candidate, $line['description'], $line['quantity'], $rounded[$index], $line['itemType']);
+                continue;
+            } catch (InvalidArgumentException $error) {
+                $needsReconciliation = true;
+            }
+            // A fractional line may round to zero while its ceiling is valid.
+            // Start from a valid bound, then balance other fractional lines.
+            $valid = false;
+            foreach (array('floor', 'ceil') as $direction) {
+                $alternative = self::sumMinorUnits($line['values'], $currency, $direction);
+                $candidate = array();
+                try {
+                    self::appendLine($candidate, $line['description'], $line['quantity'], $alternative, $line['itemType']);
+                    $rounded[$index] = $alternative;
+                    $valid = true;
+                    break;
+                } catch (InvalidArgumentException $error) {
+                    // The other bound may be representable; true zero never is.
+                }
+            }
+            if (!$valid) { throw new InvalidArgumentException('Unrepresentable checkout item.'); }
+        }
+        // Changing rounded lines requires evidence of aggregate rounding only;
+        // never hide a genuine mismatch by reallocating a product or tax amount.
+        if ($needsReconciliation && self::sumMinorUnits($values, $currency) !== $amount) {
             throw new InvalidArgumentException('Checkout items do not match the declared total.');
         }
         $difference = $amount - self::sumMinorUnits($rounded, 'JPY');
