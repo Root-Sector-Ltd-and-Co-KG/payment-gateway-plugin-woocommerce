@@ -305,3 +305,47 @@ foreach (array('1e3', 'NaN', '1,00', '', '92233720368547758.08') as $invalid) {
     try { WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($invalid, 'EUR'); } catch (InvalidArgumentException $error) { $rejected = true; }
     integrationAssert($rejected, 'Invalid or overflowing amount must be rejected.');
 }
+
+$oldPrecision = ini_get('precision'); $oldSerializePrecision = ini_get('serialize_precision');
+try {
+    foreach (array(array('14', '14'), array('6', '3'), array('17', '-1')) as [$precision, $serializePrecision]) {
+        ini_set('precision', $precision); ini_set('serialize_precision', $serializePrecision);
+        foreach (array(array(123456789012.345, 'KWD', 123456789012345), array(1.005, 'EUR', 101), array(-1.005, 'EUR', -101), array(1.0e-7, 'EUR', 0), array(1.0e12, 'JPY', 1000000000000)) as [$value, $currency, $expected]) {
+            integrationAssert($expected === WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($value, $currency), 'Legacy floats must not depend on ini precision.');
+        }
+        $order = new AmountTestOrder(); $order->currency = 'KWD'; $order->total = 123456789012.345;
+        [$result, $payload] = amountCheckout($order, 'included', false);
+        integrationAssert($result['result'] === 'success' && $payload['amount'] === 123456789012345 && !isset($payload['items']), 'Production checkout must preserve legacy float without item forwarding.');
+    }
+} finally {
+    ini_set('precision', $oldPrecision); ini_set('serialize_precision', $oldSerializePrecision);
+}
+foreach (array(INF, -INF, NAN, 1.0e20, 9007199254740992.0, '1e3') as $invalid) {
+    $rejected = false;
+    try { WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($invalid, 'JPY'); } catch (InvalidArgumentException $error) { $rejected = true; }
+    integrationAssert($rejected, 'Non-finite, ambiguous or exponent-string values must fail safely.');
+}
+
+foreach (array(array('1.004', '2.004'), array('1.006', '2.006')) as [$first, $second]) {
+    $order = new AmountTestOrder(); $order->total = 3.01;
+    $order->items = array(new AmountTestItem($first, '0', 1, false, 'First'), new AmountTestItem($second, '0', 2, true, 'Second'));
+    [$result, $payload] = amountCheckout($order);
+    integrationAssert($result['result'] === 'success', 'Only aggregate rounding drift must be reconciled.');
+    $sum = 0; foreach ($payload['items'] as $item) { $sum += $item['quantity'] * $item['unitPrice']; }
+    integrationAssert($sum === 301 && array_sum(array_column($payload['items'], 'quantity')) === 3, 'Reconciliation must preserve quantity and declared amount.');
+}
+
+$roundedItems = WC_Payment_Gateway_App_Checkout_Amounts::buildItems(array(
+    array('description' => 'Small', 'quantity' => 1, 'values' => array('0.005'), 'itemType' => 'goods'),
+    array('description' => 'Adjustable', 'quantity' => 1, 'values' => array('1.005'), 'itemType' => 'goods'),
+    array('description' => 'Exact tax', 'quantity' => 1, 'values' => array('0.20'), 'itemType' => 'tax'),
+), 121, 'EUR');
+integrationAssert(array(1, 100, 20) === array_column($roundedItems, 'unitPrice'), 'Reconciliation must skip zero-price alternatives and preserve exact tax.');
+
+// Near 9e12 KWD, binary64 spacing exceeds 0.001 KWD; reject the
+// legacy float rather than pretending it identifies an adjacent minor unit.
+$ambiguousKwdRejected = false;
+try { WC_Payment_Gateway_App_Checkout_Amounts::minorUnits(9000000000000.001, 'KWD'); }
+catch (InvalidArgumentException $error) { $ambiguousKwdRejected = true; }
+integrationAssert($ambiguousKwdRejected, 'Adjacent KWD minor units must remain distinguishable for legacy floats.');
+integrationAssert(9000000000000001 === WC_Payment_Gateway_App_Checkout_Amounts::minorUnits('9000000000000.001', 'KWD'), 'Canonical decimal strings must retain full minor-unit precision.');
