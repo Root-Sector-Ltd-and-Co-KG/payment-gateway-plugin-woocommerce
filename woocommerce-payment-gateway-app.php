@@ -16,6 +16,241 @@
 defined('ABSPATH') || exit;
 require_once __DIR__ . '/includes/class-payment-gateway-app-api-error-context.php';
 
+/** Exact decimal arithmetic for the gateway's integer minor-unit wire contract. */
+final class WC_Payment_Gateway_App_Checkout_Amounts
+{
+    public static function currency($currency)
+    {
+        $currency = strtoupper(trim((string)$currency));
+        if (!preg_match('/\A[A-Z]{3}\z/', $currency)) {
+            throw new InvalidArgumentException('Invalid checkout currency.');
+        }
+        return $currency;
+    }
+
+    private static function digits($currency)
+    {
+        // Keep aligned with main-backend/internal/money/amount.go.
+        $currency = self::currency($currency);
+        if (in_array($currency, array('BIF', 'CLP', 'DJF', 'GNF', 'ISK', 'JPY', 'KMF', 'KRW', 'PYG', 'RWF', 'UGX', 'UYI', 'VND', 'VUV', 'XAF', 'XOF', 'XPF'), true)) { return 0; }
+        if (in_array($currency, array('BHD', 'IQD', 'JOD', 'KWD', 'LYD', 'OMR', 'TND'), true)) { return 3; }
+        return in_array($currency, array('CLF', 'UYW'), true) ? 4 : 2;
+    }
+
+    private static function decimal($value, $digits)
+    {
+        if (!is_float($value)) { return $value; }
+        // Conservative bound keeps binary spacing below one minor unit even
+        // when the decimal scale falls between powers of two. Canonical decimal
+        // strings remain supported up to PHP_INT_MAX.
+        if (!is_finite($value) || abs($value) >= 4503599627370496.0 / (10 ** $digits)) {
+            throw new InvalidArgumentException('Ambiguous checkout float amount.');
+        }
+        // Find the shortest decimal that round-trips to the legacy float.
+        // Explicit significant digits and locale-independent H avoid both PHP
+        // precision settings and the binary tail of values such as 1.005.
+        for ($precision = 1; $precision <= 17; $precision++) {
+            $decimal = sprintf('%.' . $precision . 'H', $value);
+            if ((float)$decimal === $value) { break; }
+        }
+        if (stripos($decimal, 'e') === false) { return $decimal; }
+        // Only internally formatted floats may use exponent notation. Strings
+        // supplied by callers still pass the strict plain-decimal parser.
+        list($mantissa, $exponent) = preg_split('/e/i', $decimal);
+        $negative = $mantissa[0] === '-';
+        $mantissa = ltrim($mantissa, '-');
+        $point = strpos($mantissa, '.');
+        $point = ($point === false ? strlen($mantissa) : $point) + (int)$exponent;
+        $integer = str_replace('.', '', $mantissa);
+        if ($point <= 0) {
+            $decimal = '0.' . str_repeat('0', -$point) . $integer;
+        } elseif ($point >= strlen($integer)) {
+            $decimal = $integer . str_repeat('0', $point - strlen($integer));
+        } else {
+            $decimal = substr($integer, 0, $point) . '.' . substr($integer, $point);
+        }
+        return ($negative ? '-' : '') . $decimal;
+    }
+
+    public static function minorUnits($value, $currency)
+    {
+        return self::sumMinorUnits(array($value), $currency);
+    }
+
+    public static function sumMinorUnits(array $values, $currency, $rounding = 'nearest')
+    {
+        $digits = self::digits($currency);
+        $scale = $digits;
+        $parts = array();
+        foreach ($values as $value) {
+            $value = self::decimal($value, $digits);
+            if ((!is_string($value) && !is_int($value) && !is_float($value))
+                || !preg_match('/\A(-?)([0-9]+)(?:\.([0-9]+))?\z/', (string)$value, $part)) {
+                throw new InvalidArgumentException('Invalid checkout decimal amount.');
+            }
+            $part[3] = isset($part[3]) ? $part[3] : '';
+            $scale = max($scale, strlen($part[3]));
+            $parts[] = $part;
+        }
+        $sum = '0';
+        foreach ($parts as $part) {
+            $sum = self::add($sum, $part[1] . $part[2] . str_pad($part[3], $scale, '0'));
+        }
+        $negative = $sum[0] === '-';
+        $absolute = str_pad(ltrim($sum, '-'), $scale + 1, '0', STR_PAD_LEFT);
+        $cut = strlen($absolute) - $scale + $digits;
+        $minor = substr($absolute, 0, $cut);
+        // Round once after summing decimal components, half away from zero.
+        $fraction = substr($absolute, $cut);
+        $hasFraction = trim($fraction, '0') !== '';
+        if (($rounding === 'nearest' && $fraction !== '' && $fraction[0] >= '5')
+            || ($hasFraction && (($rounding === 'floor' && $negative) || ($rounding === 'ceil' && !$negative)))) {
+            $minor = self::add($minor, '1');
+        }
+        $minor = ltrim($minor, '0');
+        $minor = $minor === '' ? '0' : $minor;
+        $limit = (string)PHP_INT_MAX;
+        if (strlen($minor) > strlen($limit) || (strlen($minor) === strlen($limit) && strcmp($minor, $limit) > 0)) {
+            throw new InvalidArgumentException('Checkout amount exceeds integer range.');
+        }
+        return $negative ? -(int)$minor : (int)$minor;
+    }
+
+    // Signed integer-string addition avoids binary floats, including for net + tax.
+    private static function add($left, $right)
+    {
+        $leftNegative = $left[0] === '-'; $rightNegative = $right[0] === '-';
+        $left = ltrim(ltrim($left, '-'), '0'); $right = ltrim(ltrim($right, '-'), '0');
+        $left = $left === '' ? '0' : $left; $right = $right === '' ? '0' : $right;
+        $subtract = $leftNegative !== $rightNegative;
+        if ($subtract) {
+            $compare = strlen($left) === strlen($right) ? strcmp($left, $right) : strlen($left) - strlen($right);
+            if ($compare < 0) { $swap = $left; $left = $right; $right = $swap; $leftNegative = $rightNegative; }
+        }
+        $result = ''; $carry = 0;
+        for ($i = strlen($left) - 1, $j = strlen($right) - 1; $i >= 0 || $j >= 0; $i--, $j--) {
+            $a = $i >= 0 ? (int)$left[$i] : 0; $b = $j >= 0 ? (int)$right[$j] : 0;
+            if (!$subtract) {
+                $digit = $a + $b + $carry; $carry = intdiv($digit, 10); $digit %= 10;
+            } else {
+                $digit = $a - $b - $carry; $carry = $digit < 0 ? 1 : 0;
+                if ($digit < 0) { $digit += 10; }
+            }
+            $result = $digit . $result;
+        }
+        if ($carry && !$subtract) { $result = $carry . $result; }
+        $result = ltrim($result, '0');
+        return $result === '' ? '0' : ($leftNegative ? '-' : '') . $result;
+    }
+
+    public static function appendLine(array &$items, $description, $quantity, $amount, $type)
+    {
+        if (!preg_match('/\A[1-9][0-9]*\z/', (string)$quantity)
+            || strlen((string)$quantity) > strlen((string)PHP_INT_MAX)
+            || (strlen((string)$quantity) === strlen((string)PHP_INT_MAX) && strcmp((string)$quantity, (string)PHP_INT_MAX) > 0)) {
+            throw new InvalidArgumentException('Invalid checkout item quantity.');
+        }
+        $quantity = (int)$quantity;
+        $unit = intdiv($amount, $quantity);
+        $remainder = abs($amount % $quantity);
+        // The API requires positive units (negative for discounts). Never invent
+        // a quantity or change a product/tax total to make an invalid line fit.
+        if (($type === 'discount' && $unit >= 0) || ($type !== 'discount' && $unit <= 0)) {
+            throw new InvalidArgumentException('Checkout item cannot be represented in minor units.');
+        }
+        $items[] = array('description' => $description, 'quantity' => $quantity - $remainder, 'unitPrice' => $unit, 'itemType' => $type);
+        if ($remainder !== 0) {
+            $items[] = array('description' => $description, 'quantity' => $remainder, 'unitPrice' => $unit + ($amount < 0 ? -1 : 1), 'itemType' => $type);
+        }
+    }
+
+    private static function appendAllocatedLine(array &$items, array $line, $amount)
+    {
+        // Only explicitly optional, single-unit checkout components may vanish
+        // at zero. Product lines retain appendLine's strict price/quantity rules.
+        if ($amount === 0 && $line['quantity'] === 1 && isset($line['omitIfZero']) && $line['omitIfZero'] === true) {
+            return;
+        }
+        self::appendLine($items, $line['description'], $line['quantity'], $amount, $line['itemType']);
+    }
+
+    public static function buildItems(array $lines, $amount, $currency)
+    {
+        $values = array(); $rounded = array();
+        foreach ($lines as $line) {
+            foreach ($line['values'] as $value) { $values[] = $value; }
+            $rounded[] = self::sumMinorUnits($line['values'], $currency);
+        }
+        // Merchants may round each line independently. Preserve already-valid
+        // rounded lines when their total matches, even if raw aggregation differs.
+        $needsReconciliation = self::sumMinorUnits($rounded, 'JPY') !== $amount;
+        foreach ($lines as $index => $line) {
+            $candidate = array();
+            try {
+                self::appendAllocatedLine($candidate, $line, $rounded[$index]);
+                continue;
+            } catch (InvalidArgumentException $error) {
+                $needsReconciliation = true;
+            }
+            // A fractional line may round to zero while its ceiling is valid.
+            // Start from a valid bound, then balance other fractional lines.
+            $valid = false;
+            foreach (array('floor', 'ceil') as $direction) {
+                $alternative = self::sumMinorUnits($line['values'], $currency, $direction);
+                $candidate = array();
+                try {
+                    self::appendAllocatedLine($candidate, $line, $alternative);
+                    $rounded[$index] = $alternative;
+                    $valid = true;
+                    break;
+                } catch (InvalidArgumentException $error) {
+                    // The other bound may be representable; true zero never is.
+                }
+            }
+            if (!$valid) { throw new InvalidArgumentException('Unrepresentable checkout item.'); }
+        }
+        // Changing rounded lines requires evidence of aggregate rounding only;
+        // never hide a genuine mismatch by reallocating a product or tax amount.
+        if ($needsReconciliation && self::sumMinorUnits($values, $currency) !== $amount) {
+            throw new InvalidArgumentException('Checkout items do not match the declared total.');
+        }
+        $difference = $amount - self::sumMinorUnits($rounded, 'JPY');
+        foreach ($lines as $index => $line) {
+            if ($difference === 0) { break; }
+            $step = $difference > 0 ? 1 : -1;
+            $alternative = self::sumMinorUnits($line['values'], $currency, $step > 0 ? 'ceil' : 'floor');
+            if ($alternative !== $rounded[$index]) {
+                $candidate = array();
+                try {
+                    self::appendAllocatedLine($candidate, $line, $alternative);
+                } catch (InvalidArgumentException $error) {
+                    continue; // Try another fractional line; never introduce a zero-priced unit.
+                }
+                // Stay within this line's floor/ceiling; exact product, fee and
+                // tax amounts are never adjusted to absorb someone else's drift.
+                $rounded[$index] = $alternative;
+                $difference -= $step;
+            }
+        }
+        if ($difference !== 0) { throw new InvalidArgumentException('Unrepresentable checkout rounding.'); }
+        $items = array();
+        foreach ($lines as $index => $line) {
+            self::appendAllocatedLine($items, $line, $rounded[$index]);
+        }
+        self::validateTotal($items, $amount);
+        return $items;
+    }
+
+    public static function validateTotal(array $items, $amount)
+    {
+        $totals = array();
+        foreach ($items as $item) { $totals[] = $item['quantity'] * $item['unitPrice']; }
+        if (self::sumMinorUnits($totals, 'JPY') !== $amount) {
+            throw new InvalidArgumentException('Checkout items do not match the declared total.');
+        }
+    }
+}
+
 final class WC_Payment_Gateway_App_IPN_Request
 {
     const SIGNATURE_TOLERANCE_SECONDS = 300;
@@ -908,165 +1143,80 @@ function init_woocommerce_payment_gateway_app()
                 $this->log->debug('Preparing hashData', array('source' => 'woocommerce-payment-gateway-app', 'order_id' => $order_id));
             }
 
-            $hashData = array(
-                'amount' => round($order->get_total() * 100), // Amount in cents
-                'currency' => get_woocommerce_currency(),
-                'email' => $email,
-                'externalReference' => (string) $order_id,
-                'returnUrl' => $returnurl,
-                'cancelUrl' => $cancelurl,
-                'ipnUrl' => $ipnurl,
-            );
-
-            if ('yes' === $this->get_option('pass_billing_address')) {
-                $hashData['billingAddress'] = array(
-                    'firstName' => $order->get_billing_first_name(),
-                    'lastName' => $order->get_billing_last_name(),
-                    'address1' => $order->get_billing_address_1(),
-                    'address2' => $order->get_billing_address_2(),
-                    'city' => $order->get_billing_city(),
-                    'postcode' => $order->get_billing_postcode(),
-                    'country' => $order->get_billing_country(),
-                    'phone' => $order->get_billing_phone(),
+            try {
+                $currency = WC_Payment_Gateway_App_Checkout_Amounts::currency($order->get_currency());
+                $amount = WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($order->get_total(), $currency);
+                if ($amount <= 0) { throw new InvalidArgumentException('Invalid checkout amount.'); }
+                $hashData = array(
+                    'amount' => $amount,
+                    'currency' => $currency,
+                    'email' => $email,
+                    'externalReference' => (string) $order_id,
+                    'returnUrl' => $returnurl,
+                    'cancelUrl' => $cancelurl,
+                    'ipnUrl' => $ipnurl,
                 );
-            }
-        
-            if ('yes' === $this->get_option('pass_shipping_address')) {
-                $hashData['shippingAddress'] = array(
-                    'firstName' => $order->get_shipping_first_name(),
-                    'lastName' => $order->get_shipping_last_name(),
-                    'address1' => $order->get_shipping_address_1(),
-                    'address2' => $order->get_shipping_address_2(),
-                    'city' => $order->get_shipping_city(),
-                    'postcode' => $order->get_shipping_postcode(),
-                    'country' => $order->get_shipping_country(),
-                );
-            }
-        
-            if ('yes' === $this->get_option('pass_items')) {
-                $items = array();
-                $tax_handling = $this->get_option('tax_handling', 'included');
 
-                if ($tax_handling === 'included') {
-                    // Tax-included mode: each item's unitPrice contains its share of tax.
-                    // No separate tax line item. This is the recommended mode when Payment
-                    // Gateway App has its own tax calculation enabled (it extracts tax from gross).
-
-                    // Product items (gross = net + tax, after coupons)
+                if ('yes' === $this->get_option('pass_billing_address')) {
+                    $hashData['billingAddress'] = array(
+                        'firstName' => $order->get_billing_first_name(),
+                        'lastName' => $order->get_billing_last_name(),
+                        'address1' => $order->get_billing_address_1(),
+                        'address2' => $order->get_billing_address_2(),
+                        'city' => $order->get_billing_city(),
+                        'postcode' => $order->get_billing_postcode(),
+                        'country' => $order->get_billing_country(),
+                        'phone' => $order->get_billing_phone(),
+                    );
+                }
+        
+                if ('yes' === $this->get_option('pass_shipping_address')) {
+                    $hashData['shippingAddress'] = array(
+                        'firstName' => $order->get_shipping_first_name(),
+                        'lastName' => $order->get_shipping_last_name(),
+                        'address1' => $order->get_shipping_address_1(),
+                        'address2' => $order->get_shipping_address_2(),
+                        'city' => $order->get_shipping_city(),
+                        'postcode' => $order->get_shipping_postcode(),
+                        'country' => $order->get_shipping_country(),
+                    );
+                }
+        
+                if ('yes' === $this->get_option('pass_items')) {
+                    $lines = array();
+                    $included = $this->get_option('tax_handling', 'included') === 'included';
+                    // Retain exact decimal components until aggregate rounding.
                     foreach ($order->get_items() as $item) {
                         $product = $item->get_product();
-                        $item_type = ($product && $product->is_virtual()) ? 'digital_service' : 'goods';
-                        $quantity = max(1, (int)$item->get_quantity());
-                        $line_gross = $item->get_total() + $item->get_total_tax();
-                        $items[] = array(
-                            'description' => $item->get_name(),
-                            'quantity'    => $quantity,
-                            'unitPrice'   => round(($line_gross / $quantity) * 100),
-                            'itemType'    => $item_type
-                        );
+                        $type = ($product && $product->is_virtual()) ? 'digital_service' : 'goods';
+                        $lines[] = array('description' => $item->get_name(), 'quantity' => $item->get_quantity(),
+                            'values' => array($item->get_total(), $included ? $item->get_total_tax() : '0'), 'itemType' => $type);
                     }
-
-                    // Shipping item (gross)
-                    $shipping_gross = $order->get_shipping_total() + $order->get_shipping_tax();
-                    if ($shipping_gross > 0) {
-                        $items[] = array(
-                            'description' => 'Shipping',
-                            'quantity'    => 1,
-                            'unitPrice'   => round($shipping_gross * 100),
-                            'itemType'    => 'shipping'
-                        );
-                    }
-
-                    // Fee items (gross) — e.g. surcharges added by other plugins
+                    // Keep optional raw components through allocation. Rounding
+                    // each to zero here can lose a real aggregate minor unit.
+                    $shippingValues = array($order->get_shipping_total(), $included ? $order->get_shipping_tax() : '0');
+                    $lines[] = array('description' => 'Shipping', 'quantity' => 1, 'values' => $shippingValues,
+                        'itemType' => 'shipping', 'omitIfZero' => true);
                     foreach ($order->get_fees() as $fee) {
-                        $fee_gross = $fee->get_total() + $fee->get_total_tax();
-                        if ($fee_gross != 0) {
-                            $items[] = array(
-                                'description' => $fee->get_name(),
-                                'quantity'    => 1,
-                                'unitPrice'   => round($fee_gross * 100),
-                                'itemType'    => $fee_gross < 0 ? 'discount' : 'digital_service'
-                            );
-                        }
+                        $feeValues = array($fee->get_total(), $included ? $fee->get_total_tax() : '0');
+                        // Only zero-rounded fees need floor to recover their sign.
+                        $feeAmount = WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits($feeValues, $currency);
+                        $negative = $feeAmount < 0 || ($feeAmount === 0
+                            && WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits($feeValues, $currency, 'floor') < 0);
+                        $lines[] = array('description' => $fee->get_name(), 'quantity' => 1, 'values' => $feeValues,
+                            'itemType' => $negative ? 'discount' : 'digital_service', 'omitIfZero' => true);
                     }
-                } else {
-                    // Separate-tax mode: items are sent at net prices (after coupons, before tax)
-                    // with a single "Tax" line item. Use this when Payment Gateway App does NOT
-                    // calculate tax and you want to pass WooCommerce's tax calculation through.
-
-                    // Product items (net, after coupons)
-                    foreach ($order->get_items() as $item) {
-                        $product = $item->get_product();
-                        $item_type = ($product && $product->is_virtual()) ? 'digital_service' : 'goods';
-                        $quantity = max(1, (int)$item->get_quantity());
-                        $items[] = array(
-                            'description' => $item->get_name(),
-                            'quantity'    => $quantity,
-                            'unitPrice'   => round(($item->get_total() / $quantity) * 100),
-                            'itemType'    => $item_type
-                        );
+                    if (!$included) {
+                        $lines[] = array('description' => 'Tax', 'quantity' => 1, 'values' => array($order->get_total_tax()),
+                            'itemType' => 'tax', 'omitIfZero' => true);
                     }
-
-                    // Shipping item (net)
-                    if ($order->get_shipping_total() > 0) {
-                        $items[] = array(
-                            'description' => 'Shipping',
-                            'quantity'    => 1,
-                            'unitPrice'   => round($order->get_shipping_total() * 100),
-                            'itemType'    => 'shipping'
-                        );
-                    }
-
-                    // Fee items (net)
-                    foreach ($order->get_fees() as $fee) {
-                        if ($fee->get_total() != 0) {
-                            $items[] = array(
-                                'description' => $fee->get_name(),
-                                'quantity'    => 1,
-                                'unitPrice'   => round($fee->get_total() * 100),
-                                'itemType'    => $fee->get_total() < 0 ? 'discount' : 'digital_service'
-                            );
-                        }
-                    }
-
-                    // Tax line item
-                    if ($order->get_total_tax() > 0) {
-                        $items[] = array(
-                            'description' => 'Tax',
-                            'quantity'    => 1,
-                            'unitPrice'   => round($order->get_total_tax() * 100),
-                            'itemType'    => 'tax'
-                        );
-                    }
+                    $hashData['items'] = WC_Payment_Gateway_App_Checkout_Amounts::buildItems($lines, $amount, $currency);
                 }
-
-                // Correct for rounding errors by ensuring the sum of items exactly equals the order total.
-                $items_total_cents = 0;
-                foreach ($items as $it) {
-                    $items_total_cents += $it['unitPrice'] * $it['quantity'];
-                }
-
-                $total_cents = round($order->get_total() * 100);
-                $diff_cents = $total_cents - $items_total_cents;
-
-                if ($diff_cents != 0 && count($items) > 0) {
-                    // Adjust the last product/shipping item (avoid adjusting discount items).
-                    $adjusted = false;
-                    for ($i = count($items) - 1; $i >= 0; $i--) {
-                        if (in_array($items[$i]['itemType'], array('goods', 'digital_service', 'shipping', 'tax'), true)) {
-                            $items[$i]['unitPrice'] += $diff_cents;
-                            $adjusted = true;
-                            break;
-                        }
-                    }
-                    if (!$adjusted) {
-                        $items[count($items) - 1]['unitPrice'] += $diff_cents;
-                    }
-                }
-
-                $hashData['items'] = $items;
+            } catch (InvalidArgumentException $error) {
+                wc_add_notice(__('Payment cannot be started because the order amounts cannot be represented exactly. Please contact support.', 'woo-payment-gateway-app'), 'error');
+                return array('result' => 'failure');
             }
-            
+
             if ($this->debug) {
                 $this->log->debug('Preparing to send request', array(
                     'source' => 'woocommerce-payment-gateway-app',

@@ -50,6 +50,7 @@ class RiskTestOrder
     public function get_billing_country(): string { return 'DE'; }
     public function get_cancel_order_url(): string { return 'https://shop.example.test/cancel'; }
     public function get_total(): float { return 12.34; }
+    public function get_currency(): string { return 'EUR'; }
     public function get_id(): int { return 42; }
     public function update_status($status, $note = ''): void { $this->statuses[] = array($status, $note); }
     public function update_meta_data($key, $value): void { $this->meta[(string)$key] = $value; }
@@ -215,3 +216,191 @@ integrationAssert(str_contains($notices[0][1], 'unexpected error') && str_contai
 integrationAssert(!str_contains(json_encode(array($notices, $logger->entries)), 'private-backend-detail'), 'Server details must remain private.');
 
 echo "WooCommerce customer-risk and phone integration: PASS\n";
+
+// Exercise the actual checkout payload, including a saved order currency that
+// differs from the shop's current EUR setting. No network is used by the stub.
+class AmountTestItem
+{
+    public function __construct(public string $net, public string $tax = '0', public int $quantity = 1, public bool $virtual = false, public string $name = 'Product') {}
+    public function get_total() { return $this->net; }
+    public function get_total_tax() { return $this->tax; }
+    public function get_quantity() { return $this->quantity; }
+    public function get_product() { return $this; }
+    public function is_virtual() { return $this->virtual; }
+    public function get_name() { return $this->name; }
+}
+class AmountTestOrder extends RiskTestOrder
+{
+    public string $currency = 'EUR';
+    public array $items = array();
+    public array $fees = array();
+    public string $shipping = '0';
+    public string $shippingTax = '0';
+    public string $tax = '0';
+    public float $total = 10.0;
+    public function get_total(): float { return $this->total; }
+    public function get_currency(): string { return $this->currency; }
+    public function get_items() { return $this->items; }
+    public function get_fees() { return $this->fees; }
+    public function get_shipping_total() { return $this->shipping; }
+    public function get_shipping_tax() { return $this->shippingTax; }
+    public function get_total_tax() { return $this->tax; }
+}
+function amountCheckout(AmountTestOrder $order, string $mode = 'included', bool $passItems = true): array
+{
+    $GLOBALS['gateway_options'] = array('api_domain' => 'api.example.test', 'api_key' => 'test-only', 'site_id' => 'site', 'pass_items' => $passItems ? 'yes' : 'no', 'tax_handling' => $mode);
+    $GLOBALS['gateway_order'] = $order;
+    $GLOBALS['gateway_requests'] = array();
+    $GLOBALS['gateway_notices'] = array();
+    $GLOBALS['gateway_response'] = array('response' => array('code' => 200), 'body' => '{"paymentUrl":"https://pay.example.test/session"}');
+    $result = (new WooCommerce_Payment_Gateway_App())->process_payment(42);
+    return array($result, isset($GLOBALS['gateway_requests'][0]) ? json_decode($GLOBALS['gateway_requests'][0]['body'], true) : null);
+}
+foreach (array(array('JPY', 1000, '1000', 1000), array('EUR', 10, '10.00', 1000), array('KWD', 1.234, '1.234', 1234)) as [$currency, $major, $line, $minor]) {
+    $order = new AmountTestOrder();
+    $order->currency = $currency;
+    $order->total = $major;
+    $order->items = array(new AmountTestItem($line, '0', 3));
+    [$result, $payload] = amountCheckout($order);
+    integrationAssert($result['result'] === 'success' && $payload['amount'] === $minor && $payload['currency'] === $currency, 'Use saved order currency and its minor units: ' . $currency);
+    integrationAssert(array_sum(array_column($payload['items'], 'quantity')) === 3, 'Split prices must preserve original quantity.');
+    $sum = 0;
+    foreach ($payload['items'] as $item) { $sum += $item['quantity'] * $item['unitPrice']; integrationAssert($item['itemType'] === 'goods', 'Product type must be preserved.'); }
+    integrationAssert($sum === $minor, 'Split item amounts must equal declared total.');
+    if ($currency === 'EUR') { integrationAssert($payload['items'][0]['unitPrice'] === 333 && $payload['items'][0]['quantity'] === 2 && $payload['items'][1]['unitPrice'] === 334, 'EUR 10 / 3 must allocate exactly two 333 and one 334 unit.'); }
+}
+foreach (array('included', 'separate') as $mode) {
+    $order = new AmountTestOrder();
+    $order->total = 12.5;
+    $order->items = array(new AmountTestItem('8.40', '1.60', 3, true));
+    $order->shipping = '2.00'; $order->shippingTax = '0.40'; $order->tax = '2.00';
+    $order->fees = array(new AmountTestItem('0.60', '0', 1, true, 'Fee'), new AmountTestItem('-0.50', '0', 1, true, 'Discount'));
+    [$result, $payload] = amountCheckout($order, $mode);
+    integrationAssert($result['result'] === 'success' && $payload['amount'] === 1250, 'Tax modes must retain final order amount.');
+    $totals = array(); foreach ($payload['items'] as $item) { $totals[$item['itemType']] = ($totals[$item['itemType']] ?? 0) + $item['quantity'] * $item['unitPrice']; }
+    integrationAssert(array_sum($totals) === 1250 && $totals['discount'] === -50 && $totals['shipping'] === ($mode === 'included' ? 240 : 200), 'Fees, discounts and shipping must retain their meanings.');
+    integrationAssert(($totals['tax'] ?? 0) === ($mode === 'included' ? 0 : 200), 'Separate tax must remain exact and included tax must not be duplicated.');
+}
+$order = new AmountTestOrder(); $order->total = 0.01; $order->items = array(new AmountTestItem('0.01', '0', 3));
+[$result, $payload] = amountCheckout($order);
+integrationAssert($result['result'] === 'failure' && $payload === null && count($GLOBALS['gateway_notices']) === 1, 'Unrepresentable positive unit prices must fail visibly before sending.');
+[$result, $payload] = amountCheckout($order, 'included', false);
+integrationAssert($result['result'] === 'success' && $payload['amount'] === 1 && !isset($payload['items']), 'Merchant can explicitly disable item forwarding without changing the order amount.');
+$order->total = 10; $order->items = array(new AmountTestItem('9.00'));
+[$result, $payload] = amountCheckout($order);
+integrationAssert($result['result'] === 'failure' && $payload === null, 'A genuine line/order mismatch must not alter a product or tax amount.');
+echo "WooCommerce checkout amount contract: PASS\n";
+
+foreach (array(
+    array('JPY', '1000', 1000), array('EUR', '0.29', 29), array('KWD', '1.234', 1234),
+    array('CLF', '1.2345', 12345), array('eur', '1.005', 101), array('EUR', '-1.005', -101),
+    array('EUR', '90071992547409.91', 9007199254740991), array('EUR', '92233720368547758.07', PHP_INT_MAX),
+) as [$currency, $value, $expected]) {
+    integrationAssert($expected === WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($value, $currency), 'Exact decimal conversion: ' . $value);
+}
+integrationAssert(1 === WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits(array('0.004', '0.004'), 'EUR'), 'Gross is rounded only after exact summation.');
+integrationAssert(-125 === WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits(array('0.25', '-1.50'), 'EUR'), 'Mixed-sign summation must preserve discounts.');
+foreach (array('1e3', 'NaN', '1,00', '', '92233720368547758.08') as $invalid) {
+    $rejected = false;
+    try { WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($invalid, 'EUR'); } catch (InvalidArgumentException $error) { $rejected = true; }
+    integrationAssert($rejected, 'Invalid or overflowing amount must be rejected.');
+}
+
+$oldPrecision = ini_get('precision'); $oldSerializePrecision = ini_get('serialize_precision');
+try {
+    foreach (array(array('14', '14'), array('6', '3'), array('17', '-1')) as [$precision, $serializePrecision]) {
+        ini_set('precision', $precision); ini_set('serialize_precision', $serializePrecision);
+        foreach (array(array(123456789012.345, 'KWD', 123456789012345), array(1.005, 'EUR', 101), array(-1.005, 'EUR', -101), array(1.0e-7, 'EUR', 0), array(1.0e12, 'JPY', 1000000000000)) as [$value, $currency, $expected]) {
+            integrationAssert($expected === WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($value, $currency), 'Legacy floats must not depend on ini precision.');
+        }
+        $order = new AmountTestOrder(); $order->currency = 'KWD'; $order->total = 123456789012.345;
+        [$result, $payload] = amountCheckout($order, 'included', false);
+        integrationAssert($result['result'] === 'success' && $payload['amount'] === 123456789012345 && !isset($payload['items']), 'Production checkout must preserve legacy float without item forwarding.');
+    }
+} finally {
+    ini_set('precision', $oldPrecision); ini_set('serialize_precision', $oldSerializePrecision);
+}
+foreach (array(INF, -INF, NAN, 1.0e20, 9007199254740992.0, '1e3') as $invalid) {
+    $rejected = false;
+    try { WC_Payment_Gateway_App_Checkout_Amounts::minorUnits($invalid, 'JPY'); } catch (InvalidArgumentException $error) { $rejected = true; }
+    integrationAssert($rejected, 'Non-finite, ambiguous or exponent-string values must fail safely.');
+}
+
+foreach (array(array('1.004', '2.004'), array('1.006', '2.006')) as [$first, $second]) {
+    $order = new AmountTestOrder(); $order->total = 3.01;
+    $order->items = array(new AmountTestItem($first, '0', 1, false, 'First'), new AmountTestItem($second, '0', 2, true, 'Second'));
+    [$result, $payload] = amountCheckout($order);
+    integrationAssert($result['result'] === 'success', 'Only aggregate rounding drift must be reconciled.');
+    $sum = 0; foreach ($payload['items'] as $item) { $sum += $item['quantity'] * $item['unitPrice']; }
+    integrationAssert($sum === 301 && array_sum(array_column($payload['items'], 'quantity')) === 3, 'Reconciliation must preserve quantity and declared amount.');
+}
+
+$roundedItems = WC_Payment_Gateway_App_Checkout_Amounts::buildItems(array(
+    array('description' => 'Small', 'quantity' => 1, 'values' => array('0.005'), 'itemType' => 'goods'),
+    array('description' => 'Adjustable', 'quantity' => 1, 'values' => array('1.005'), 'itemType' => 'goods'),
+    array('description' => 'Exact tax', 'quantity' => 1, 'values' => array('0.20'), 'itemType' => 'tax'),
+), 121, 'EUR');
+integrationAssert(array(1, 100, 20) === array_column($roundedItems, 'unitPrice'), 'Reconciliation must skip zero-price alternatives and preserve exact tax.');
+
+// Near 9e12 KWD, binary64 spacing exceeds 0.001 KWD; reject the
+// legacy float rather than pretending it identifies an adjacent minor unit.
+$ambiguousKwdRejected = false;
+try { WC_Payment_Gateway_App_Checkout_Amounts::minorUnits(9000000000000.001, 'KWD'); }
+catch (InvalidArgumentException $error) { $ambiguousKwdRejected = true; }
+integrationAssert($ambiguousKwdRejected, 'Adjacent KWD minor units must remain distinguishable for legacy floats.');
+integrationAssert(9000000000000001 === WC_Payment_Gateway_App_Checkout_Amounts::minorUnits('9000000000000.001', 'KWD'), 'Canonical decimal strings must retain full minor-unit precision.');
+
+foreach (array(array('1.004', '2.004', 3.00, array(100, 200)), array('0.004', '1.006', 1.01, array(1, 100))) as [$first, $second, $total, $prices]) {
+    $order = new AmountTestOrder(); $order->total = $total;
+    $order->items = array(new AmountTestItem($first, '0', 1, false, 'First'), new AmountTestItem($second, '0', 1, true, 'Second'));
+    [$result, $payload] = amountCheckout($order);
+    integrationAssert($result['result'] === 'success', 'Feasible line rounding must create a checkout.');
+    integrationAssert($prices === array_column($payload['items'], 'unitPrice'), 'Preserve balanced lines or choose valid floor/ceil prices.');
+    integrationAssert(array(1, 1) === array_column($payload['items'], 'quantity'), 'Do not invent items or change quantities.');
+}
+$order = new AmountTestOrder(); $order->total = 1.01;
+$order->items = array(new AmountTestItem('0'), new AmountTestItem('1.01'));
+[$result, $payload] = amountCheckout($order);
+integrationAssert($result['result'] === 'failure' && $payload === null, 'A true zero line has no valid positive floor/ceil and must still fail.');
+
+// Preserve optional decimal rows until allocation; they may legitimately remain
+// absent when allocated zero, unlike an ordinary product's strict positive price.
+foreach (array('shipping', 'fee', 'negative_fee', 'separate_tax', 'included_item_tax', 'shipping_tax') as $kind) {
+    $order = new AmountTestOrder();
+    $order->total = $kind === 'negative_fee' ? 1.00 : 1.01;
+    $order->items = array(new AmountTestItem($kind === 'negative_fee' ? '1.006' : '1.004'));
+    if ($kind === 'shipping') { $order->shipping = '0.004'; }
+    if ($kind === 'shipping_tax') { $order->shippingTax = '0.004'; }
+    if ($kind === 'fee' || $kind === 'negative_fee') { $order->fees = array(new AmountTestItem($kind === 'negative_fee' ? '-0.004' : '0.004', '0', 1, true, 'Small fee')); }
+    if ($kind === 'separate_tax') { $order->tax = '0.004'; }
+    if ($kind === 'included_item_tax') { $order->items[0]->tax = '0.004'; }
+    [$result, $payload] = amountCheckout($order, $kind === 'separate_tax' ? 'separate' : 'included');
+    integrationAssert($result['result'] === 'success', 'Raw optional components must survive until aggregate rounding: ' . $kind);
+    integrationAssert($payload['amount'] === ($kind === 'negative_fee' ? 100 : 101), 'Optional allocation must preserve the declared amount.');
+    integrationAssert(count($payload['items']) === 1 && $payload['items'][0]['unitPrice'] === $payload['amount'] && $payload['items'][0]['quantity'] === 1, 'Stable product-first allocation must omit optional rows assigned zero.');
+}
+foreach (array(false, true) as $negative) {
+    $order = new AmountTestOrder(); $order->total = $negative ? 0.99 : 1.01;
+    $order->items = array(new AmountTestItem('1.00'));
+    if ($negative) {
+        $order->fees = array(new AmountTestItem('-0.004', '0', 1, true, 'Discount A'), new AmountTestItem('-0.004', '0', 1, true, 'Discount B'));
+    } else {
+        $order->shipping = '0.004';
+        $order->fees = array(new AmountTestItem('0.004', '0', 1, true, 'Small fee'));
+    }
+    [$result, $payload] = amountCheckout($order);
+    integrationAssert($result['result'] === 'success' && count($payload['items']) === 2, 'Optional rows must receive a minor unit when exact products cannot absorb rounding.');
+    integrationAssert($payload['items'][0]['unitPrice'] === 100 && $payload['items'][1]['unitPrice'] === ($negative ? -1 : 1), 'An exact product must remain unchanged.');
+    integrationAssert($payload['items'][1]['itemType'] === ($negative ? 'discount' : 'shipping'), 'Allocated optional rows must retain their signed fee/shipping semantics.');
+}
+$order = new AmountTestOrder(); $order->total = 1.00;
+$order->items = array(new AmountTestItem('1.004')); $order->shipping = '0.004';
+[$result, $payload] = amountCheckout($order);
+integrationAssert($result['result'] === 'success' && count($payload['items']) === 1 && $payload['items'][0]['unitPrice'] === 100, 'Already-balanced independent rounding must remain valid with an optional zero row.');
+foreach (array('included', 'separate') as $mode) {
+    $order = new AmountTestOrder(); $order->total = 1.00;
+    $order->items = array(new AmountTestItem('1.00')); $order->fees = array(new AmountTestItem('0', '0', 1, true, 'Zero fee'));
+    [$result, $payload] = amountCheckout($order, $mode);
+    integrationAssert($result['result'] === 'success' && count($payload['items']) === 1, 'True-zero shipping, fee and separate-tax rows must stay absent.');
+}
+echo "WooCommerce optional decimal amount allocation: PASS\n";
