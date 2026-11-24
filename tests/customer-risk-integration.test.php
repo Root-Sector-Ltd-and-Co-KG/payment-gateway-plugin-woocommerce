@@ -362,3 +362,45 @@ $order = new AmountTestOrder(); $order->total = 1.01;
 $order->items = array(new AmountTestItem('0'), new AmountTestItem('1.01'));
 [$result, $payload] = amountCheckout($order);
 integrationAssert($result['result'] === 'failure' && $payload === null, 'A true zero line has no valid positive floor/ceil and must still fail.');
+
+// Preserve optional decimal rows until allocation; they may legitimately remain
+// absent when allocated zero, unlike an ordinary product's strict positive price.
+foreach (array('shipping', 'fee', 'negative_fee', 'separate_tax', 'included_item_tax', 'shipping_tax') as $kind) {
+    $order = new AmountTestOrder();
+    $order->total = $kind === 'negative_fee' ? 1.00 : 1.01;
+    $order->items = array(new AmountTestItem($kind === 'negative_fee' ? '1.006' : '1.004'));
+    if ($kind === 'shipping') { $order->shipping = '0.004'; }
+    if ($kind === 'shipping_tax') { $order->shippingTax = '0.004'; }
+    if ($kind === 'fee' || $kind === 'negative_fee') { $order->fees = array(new AmountTestItem($kind === 'negative_fee' ? '-0.004' : '0.004', '0', 1, true, 'Small fee')); }
+    if ($kind === 'separate_tax') { $order->tax = '0.004'; }
+    if ($kind === 'included_item_tax') { $order->items[0]->tax = '0.004'; }
+    [$result, $payload] = amountCheckout($order, $kind === 'separate_tax' ? 'separate' : 'included');
+    integrationAssert($result['result'] === 'success', 'Raw optional components must survive until aggregate rounding: ' . $kind);
+    integrationAssert($payload['amount'] === ($kind === 'negative_fee' ? 100 : 101), 'Optional allocation must preserve the declared amount.');
+    integrationAssert(count($payload['items']) === 1 && $payload['items'][0]['unitPrice'] === $payload['amount'] && $payload['items'][0]['quantity'] === 1, 'Stable product-first allocation must omit optional rows assigned zero.');
+}
+foreach (array(false, true) as $negative) {
+    $order = new AmountTestOrder(); $order->total = $negative ? 0.99 : 1.01;
+    $order->items = array(new AmountTestItem('1.00'));
+    if ($negative) {
+        $order->fees = array(new AmountTestItem('-0.004', '0', 1, true, 'Discount A'), new AmountTestItem('-0.004', '0', 1, true, 'Discount B'));
+    } else {
+        $order->shipping = '0.004';
+        $order->fees = array(new AmountTestItem('0.004', '0', 1, true, 'Small fee'));
+    }
+    [$result, $payload] = amountCheckout($order);
+    integrationAssert($result['result'] === 'success' && count($payload['items']) === 2, 'Optional rows must receive a minor unit when exact products cannot absorb rounding.');
+    integrationAssert($payload['items'][0]['unitPrice'] === 100 && $payload['items'][1]['unitPrice'] === ($negative ? -1 : 1), 'An exact product must remain unchanged.');
+    integrationAssert($payload['items'][1]['itemType'] === ($negative ? 'discount' : 'shipping'), 'Allocated optional rows must retain their signed fee/shipping semantics.');
+}
+$order = new AmountTestOrder(); $order->total = 1.00;
+$order->items = array(new AmountTestItem('1.004')); $order->shipping = '0.004';
+[$result, $payload] = amountCheckout($order);
+integrationAssert($result['result'] === 'success' && count($payload['items']) === 1 && $payload['items'][0]['unitPrice'] === 100, 'Already-balanced independent rounding must remain valid with an optional zero row.');
+foreach (array('included', 'separate') as $mode) {
+    $order = new AmountTestOrder(); $order->total = 1.00;
+    $order->items = array(new AmountTestItem('1.00')); $order->fees = array(new AmountTestItem('0', '0', 1, true, 'Zero fee'));
+    [$result, $payload] = amountCheckout($order, $mode);
+    integrationAssert($result['result'] === 'success' && count($payload['items']) === 1, 'True-zero shipping, fee and separate-tax rows must stay absent.');
+}
+echo "WooCommerce optional decimal amount allocation: PASS\n";

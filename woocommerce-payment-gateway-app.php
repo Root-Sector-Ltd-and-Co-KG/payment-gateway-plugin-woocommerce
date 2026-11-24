@@ -164,6 +164,16 @@ final class WC_Payment_Gateway_App_Checkout_Amounts
         }
     }
 
+    private static function appendAllocatedLine(array &$items, array $line, $amount)
+    {
+        // Only explicitly optional, single-unit checkout components may vanish
+        // at zero. Product lines retain appendLine's strict price/quantity rules.
+        if ($amount === 0 && $line['quantity'] === 1 && isset($line['omitIfZero']) && $line['omitIfZero'] === true) {
+            return;
+        }
+        self::appendLine($items, $line['description'], $line['quantity'], $amount, $line['itemType']);
+    }
+
     public static function buildItems(array $lines, $amount, $currency)
     {
         $values = array(); $rounded = array();
@@ -177,7 +187,7 @@ final class WC_Payment_Gateway_App_Checkout_Amounts
         foreach ($lines as $index => $line) {
             $candidate = array();
             try {
-                self::appendLine($candidate, $line['description'], $line['quantity'], $rounded[$index], $line['itemType']);
+                self::appendAllocatedLine($candidate, $line, $rounded[$index]);
                 continue;
             } catch (InvalidArgumentException $error) {
                 $needsReconciliation = true;
@@ -189,7 +199,7 @@ final class WC_Payment_Gateway_App_Checkout_Amounts
                 $alternative = self::sumMinorUnits($line['values'], $currency, $direction);
                 $candidate = array();
                 try {
-                    self::appendLine($candidate, $line['description'], $line['quantity'], $alternative, $line['itemType']);
+                    self::appendAllocatedLine($candidate, $line, $alternative);
                     $rounded[$index] = $alternative;
                     $valid = true;
                     break;
@@ -212,7 +222,7 @@ final class WC_Payment_Gateway_App_Checkout_Amounts
             if ($alternative !== $rounded[$index]) {
                 $candidate = array();
                 try {
-                    self::appendLine($candidate, $line['description'], $line['quantity'], $alternative, $line['itemType']);
+                    self::appendAllocatedLine($candidate, $line, $alternative);
                 } catch (InvalidArgumentException $error) {
                     continue; // Try another fractional line; never introduce a zero-priced unit.
                 }
@@ -225,7 +235,7 @@ final class WC_Payment_Gateway_App_Checkout_Amounts
         if ($difference !== 0) { throw new InvalidArgumentException('Unrepresentable checkout rounding.'); }
         $items = array();
         foreach ($lines as $index => $line) {
-            self::appendLine($items, $line['description'], $line['quantity'], $rounded[$index], $line['itemType']);
+            self::appendAllocatedLine($items, $line, $rounded[$index]);
         }
         self::validateTotal($items, $amount);
         return $items;
@@ -1182,23 +1192,23 @@ function init_woocommerce_payment_gateway_app()
                         $lines[] = array('description' => $item->get_name(), 'quantity' => $item->get_quantity(),
                             'values' => array($item->get_total(), $included ? $item->get_total_tax() : '0'), 'itemType' => $type);
                     }
+                    // Keep optional raw components through allocation. Rounding
+                    // each to zero here can lose a real aggregate minor unit.
                     $shippingValues = array($order->get_shipping_total(), $included ? $order->get_shipping_tax() : '0');
-                    if (WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits($shippingValues, $currency) !== 0) {
-                        $lines[] = array('description' => 'Shipping', 'quantity' => 1, 'values' => $shippingValues, 'itemType' => 'shipping');
-                    }
+                    $lines[] = array('description' => 'Shipping', 'quantity' => 1, 'values' => $shippingValues,
+                        'itemType' => 'shipping', 'omitIfZero' => true);
                     foreach ($order->get_fees() as $fee) {
                         $feeValues = array($fee->get_total(), $included ? $fee->get_total_tax() : '0');
-                        $line = WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits($feeValues, $currency);
-                        if ($line !== 0) {
-                            $lines[] = array('description' => $fee->get_name(), 'quantity' => 1, 'values' => $feeValues,
-                                'itemType' => $line < 0 ? 'discount' : 'digital_service');
-                        }
+                        // Only zero-rounded fees need floor to recover their sign.
+                        $feeAmount = WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits($feeValues, $currency);
+                        $negative = $feeAmount < 0 || ($feeAmount === 0
+                            && WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits($feeValues, $currency, 'floor') < 0);
+                        $lines[] = array('description' => $fee->get_name(), 'quantity' => 1, 'values' => $feeValues,
+                            'itemType' => $negative ? 'discount' : 'digital_service', 'omitIfZero' => true);
                     }
                     if (!$included) {
-                        $taxValues = array($order->get_total_tax());
-                        if (WC_Payment_Gateway_App_Checkout_Amounts::sumMinorUnits($taxValues, $currency) !== 0) {
-                            $lines[] = array('description' => 'Tax', 'quantity' => 1, 'values' => $taxValues, 'itemType' => 'tax');
-                        }
+                        $lines[] = array('description' => 'Tax', 'quantity' => 1, 'values' => array($order->get_total_tax()),
+                            'itemType' => 'tax', 'omitIfZero' => true);
                     }
                     $hashData['items'] = WC_Payment_Gateway_App_Checkout_Amounts::buildItems($lines, $amount, $currency);
                 }
